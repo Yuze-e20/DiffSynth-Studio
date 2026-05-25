@@ -31,7 +31,11 @@ def launch_training_task(
         enable_optimizer_cpu_offload = args.enable_optimizer_cpu_offload
         cpu_offload_split_threshold = args.cpu_offload_split_threshold
 
-    optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
+    template_model = getattr(getattr(model, "pipe", None), "template_model", None)
+    if template_model is not None and hasattr(template_model, "make_optimizer"):
+        optimizer = template_model.make_optimizer(lr=learning_rate, weight_decay=weight_decay)
+    else:
+        optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
     dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
 
@@ -45,7 +49,12 @@ def launch_training_task(
 
     initialize_deepspeed_gradient_checkpointing(accelerator)
     for epoch_id in range(num_epochs):
-        for data in tqdm(dataloader):
+        pbar = tqdm(
+            dataloader,
+            desc=f"epoch {epoch_id + 1}/{num_epochs}",
+            disable=not accelerator.is_local_main_process,
+        )
+        for data in pbar:
             with accelerator.accumulate(model):
                 if dataset.load_from_cache:
                     loss = model({}, inputs=data)
@@ -58,10 +67,32 @@ def launch_training_task(
                 scheduler.step()
                 optimizer.zero_grad()
                 model_logger.on_step_end(accelerator, model, save_steps, loss=loss)
+                if (save_steps is not None
+                        and template_model is not None
+                        and hasattr(template_model, "save_pool")
+                        and model_logger.num_steps % save_steps == 0):
+                    accelerator.wait_for_everyone()
+                    if accelerator.is_main_process:
+                        path = os.path.join(model_logger.output_path, f"step-{model_logger.num_steps}.safetensors")
+                        template_model.save_pool(path)
+                    accelerator.wait_for_everyone()
+                pbar.set_postfix(loss=f"{loss.detach().float().item():.4f}")
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
+            if template_model is not None and hasattr(template_model, "save_pool"):
+                accelerator.wait_for_everyone()
+                if accelerator.is_main_process:
+                    path = os.path.join(model_logger.output_path, f"epoch-{epoch_id}.safetensors")
+                    template_model.save_pool(path)
+                accelerator.wait_for_everyone()
 
     model_logger.on_training_end(accelerator, model, save_steps)
+    if template_model is not None and hasattr(template_model, "save_pool"):
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            path = os.path.join(model_logger.output_path, "final.safetensors")
+            template_model.save_pool(path)
+        accelerator.wait_for_everyone()
 
 
 def launch_data_process_task(
