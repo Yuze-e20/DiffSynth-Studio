@@ -1,9 +1,19 @@
-import os, torch
+import os, torch, importlib
 from tqdm import tqdm
 from accelerate import Accelerator
 from .training_module import DiffusionTrainingModule
 from .logger import ModelLogger
 from diffsynth.core import OffloadTrainingManager
+
+
+def get_optimizer_class(customized_optimizer=None):
+    if customized_optimizer is None:
+        return torch.optim.AdamW
+    else:
+        module_name, class_name = customized_optimizer.rsplit(".", 1)
+        module = importlib.import_module(module_name)
+        print(f"Customized opimizer `{customized_optimizer}` imported.")
+        return getattr(module, class_name)
 
 
 def launch_training_task(
@@ -19,7 +29,9 @@ def launch_training_task(
     enable_model_cpu_offload: bool = False,
     enable_optimizer_cpu_offload: bool = False,
     cpu_offload_split_threshold: int = None,
+    customized_optimizer: str = None,
     args = None,
+    **kwargs,
 ):
     if args is not None:
         learning_rate = args.learning_rate
@@ -30,12 +42,18 @@ def launch_training_task(
         enable_model_cpu_offload = args.enable_model_cpu_offload
         enable_optimizer_cpu_offload = args.enable_optimizer_cpu_offload
         cpu_offload_split_threshold = args.cpu_offload_split_threshold
+        customized_optimizer = args.customized_optimizer
 
+<<<<<<< HEAD
     template_model = getattr(getattr(model, "pipe", None), "template_model", None)
     if template_model is not None and hasattr(template_model, "make_optimizer"):
         optimizer = template_model.make_optimizer(lr=learning_rate, weight_decay=weight_decay)
     else:
         optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
+=======
+    optimizer_class = get_optimizer_class(customized_optimizer)
+    optimizer = optimizer_class(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
+>>>>>>> upstream/main
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
     dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
 
@@ -102,6 +120,7 @@ def launch_data_process_task(
     model_logger: ModelLogger,
     num_workers: int = 8,
     args = None,
+    **kwargs,
 ):
     if args is not None:
         num_workers = args.dataset_num_workers

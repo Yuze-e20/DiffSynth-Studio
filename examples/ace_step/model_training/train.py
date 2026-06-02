@@ -107,12 +107,7 @@ if __name__ == "__main__":
         metadata_path=args.dataset_metadata_path,
         repeat=args.dataset_repeat,
         data_file_keys=args.data_file_keys.split(","),
-        main_data_operator=None,
-        special_operator_map={
-            "audio": ToAbsolutePath(args.dataset_base_path) >> LoadPureAudioWithTorchaudio(
-                target_sample_rate=48000,
-            ),
-        },
+        main_data_operator=ToAbsolutePath(args.dataset_base_path) >> LoadPureAudioWithTorchaudio(target_sample_rate=48000),
     )
     model = AceStepTrainingModule(
         model_paths=args.model_paths,
@@ -139,6 +134,11 @@ if __name__ == "__main__":
     model_logger = ModelLogger(
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
+        enable_tensorboard_log=args.enable_tensorboard_log,
+        enable_swanlab_log=args.enable_swanlab_log,
+        swanlab_project=args.swanlab_project,
+        enable_wandb_log=args.enable_wandb_log,
+        wandb_project=args.wandb_project,
     )
     launcher_map = {
         "sft:data_process": launch_data_process_task,
