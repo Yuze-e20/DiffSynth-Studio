@@ -44,16 +44,11 @@ def launch_training_task(
         cpu_offload_split_threshold = args.cpu_offload_split_threshold
         customized_optimizer = args.customized_optimizer
 
-<<<<<<< HEAD
     template_model = getattr(getattr(model, "pipe", None), "template_model", None)
     if template_model is not None and hasattr(template_model, "make_optimizer"):
         optimizer = template_model.make_optimizer(lr=learning_rate, weight_decay=weight_decay)
     else:
         optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
-=======
-    optimizer_class = get_optimizer_class(customized_optimizer)
-    optimizer = optimizer_class(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
->>>>>>> upstream/main
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
     dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
 
