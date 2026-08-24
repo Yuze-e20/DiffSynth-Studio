@@ -25,6 +25,7 @@ class MiniMaxH3TrainingModule(DiffusionTrainingModule):
         extra_inputs=None,
         fp8_models=None,
         offload_models=None,
+        quant_options=None,
         template_model_id_or_path=None,
         resume_from_checkpoint=None, remove_prefix_in_ckpt=None,
         silent_on_missing_audio=False,
@@ -35,11 +36,10 @@ class MiniMaxH3TrainingModule(DiffusionTrainingModule):
     ):
         super().__init__()
         # Load models
-        model_configs = self.parse_model_configs(model_paths, model_id_with_origin_paths, fp8_models=fp8_models, offload_models=offload_models, device=device)
+        model_configs = self.parse_model_configs(model_paths, model_id_with_origin_paths, fp8_models=fp8_models, offload_models=offload_models, quant_options=quant_options, device=device)
         pipe_kwargs = {}
         if processor_path is not None:
-            processor_config = self.parse_path_or_model_id(processor_path)
-            pipe_kwargs["processor_config"] = ModelConfig(model_id=processor_config.model_id, origin_file_pattern=processor_config.origin_file_pattern)
+            pipe_kwargs["processor_config"] = self.parse_path_or_model_id(processor_path)
         self.pipe = MiniMaxH3Pipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, model_configs=model_configs, **pipe_kwargs)
         self.pipe = self.load_training_template_model(self.pipe, template_model_id_or_path, use_gradient_checkpointing, use_gradient_checkpointing_offload)
         # Build a randomly initialized VACE module when no VACE checkpoint is loaded.
@@ -224,6 +224,7 @@ if __name__ == "__main__":
         extra_inputs=args.extra_inputs,
         fp8_models=args.fp8_models,
         offload_models=args.offload_models,
+        quant_options=args.quant_options,
         template_model_id_or_path=args.template_model_id_or_path,
         resume_from_checkpoint=args.resume_from_checkpoint,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
