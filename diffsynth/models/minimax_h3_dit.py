@@ -339,6 +339,7 @@ class MiniMaxH3DiT(nn.Module):
         vace=None,
         vace_context=None,
         vace_scale=1.0,
+        vace_log_variance=False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         inverse_indices = inverse_indices.view(-1).to(torch.long)
         token_tags = token_tags.view(-1).to(torch.long)
@@ -378,7 +379,7 @@ class MiniMaxH3DiT(nn.Module):
         # VACE
         if vace_context is not None:
             vace_hints = vace(
-                hidden, vace_context, t_emb, combined_indices, rope_freqs, img_pos,
+                vace_context, rope_freqs, img_pos,
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
             )
@@ -399,6 +400,9 @@ class MiniMaxH3DiT(nn.Module):
             # VACE
             if vace_context is not None and block_id in vace.vace_layers_mapping:
                 current_vace_hint = vace_hints[vace.vace_layers_mapping[block_id]]
+                if vace_log_variance:
+                    n_ctrl = current_vace_hint.shape[0]
+                    print(f"[VACE] block {block_id}: hint var {current_vace_hint.float().var().item():.6e}, backbone var {hidden[img_pos[:n_ctrl]].float().var().item():.6e}")
                 # `index_add` is out-of-place: an in-place index assignment on a
                 # tensor that requires grad breaks under gradient checkpointing.
                 hidden = hidden.index_add(0, img_pos[:current_vace_hint.shape[0]], current_vace_hint * vace_scale)

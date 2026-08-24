@@ -1,37 +1,41 @@
 import torch
 import torch.nn as nn
-from .minimax_h3_dit import MiniMaxH3DiTBlock, MINIMAX_H3_ADALN_MODALITY_NUM
+from .minimax_h3_dit import MiniMaxH3DiT, MiniMaxH3DiTBlock, MiniMaxH3TimeEmbedder
 from ..core.gradient import gradient_checkpoint_forward
 
 
 class MiniMaxH3VaceBlock(MiniMaxH3DiTBlock):
-    def __init__(self, hidden_size, num_attention_heads, attention_head_dim, ffn_hidden_size, time_embed_dim, adaln_out_features, norm_eps, qk_norm_eps, block_id=0):
+    def __init__(self, hidden_size, num_attention_heads, attention_head_dim, ffn_hidden_size, time_embed_dim, adaln_out_features, norm_eps, qk_norm_eps):
         super().__init__(hidden_size, num_attention_heads, attention_head_dim, ffn_hidden_size, time_embed_dim, adaln_out_features, norm_eps, qk_norm_eps)
-        self.block_id = block_id
-        if block_id == 0:
-            self.before_proj = nn.Linear(hidden_size, hidden_size)
-            nn.init.zeros_(self.before_proj.weight)
-            nn.init.zeros_(self.before_proj.bias)
         self.after_proj = nn.Linear(hidden_size, hidden_size)
         nn.init.zeros_(self.after_proj.weight)
         nn.init.zeros_(self.after_proj.bias)
 
-    def forward(self, c, x, *, t_emb, combined_indices, rope_freqs, cu_seqlens, max_seqlen):
-        if self.block_id == 0:
-            c = self.before_proj(c) + x
+    def forward(self, c, *, t_emb, combined_indices, rope_freqs, cu_seqlens, max_seqlen):
         c = super().forward(c, t_emb=t_emb, combined_indices=combined_indices, rope_freqs=rope_freqs, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         return self.after_proj(c), c
 
 
 class MiniMaxH3VaceModel(nn.Module):
+    """The VACE bypass, which encodes the control video into per-layer hints.
+
+    The bypass only reads the control latents, never the noisy video, and is always
+    modulated with timestep 0. Its hints are therefore constant over the sampling
+    loop and only need to be computed once. Every module mirrors its counterpart in
+    the backbone so that `init_from_dit` can warm-start all of them: `video_patch_proj`
+    embeds the control latents, `time_embedder` modulates them and `vace_blocks`
+    produce the hints."""
+
     def __init__(
         self,
-        vace_layers=(0, 7, 14, 21, 28, 35, 42, 49),
+        vace_layers=(0, 1, 2, 3, 4, 5, 6, 7),
         vace_in_dim=96,
         hidden_size=5376,
         num_attention_heads=56,
         attention_head_dim=128,
         ffn_hidden_size=14336,
+        timestep_input_dim=256,
+        time_embed_hidden_size=5376,
         time_embed_dim=2688,
         adaln_out_features=96768,
         norm_eps=1e-5,
@@ -42,44 +46,51 @@ class MiniMaxH3VaceModel(nn.Module):
         self.vace_in_dim = vace_in_dim
         self.vace_layers_mapping = {i: n for n, i in enumerate(self.vace_layers)}
 
+        # These two mirror the backbone's modules of the same name, so that
+        # `init_from_dit` can copy their weights.
+        self.video_patch_proj = nn.Linear(vace_in_dim, hidden_size, bias=True)
+        self.time_embedder = MiniMaxH3TimeEmbedder(timestep_input_dim, time_embed_hidden_size, time_embed_dim)
+
         # vace blocks
         self.vace_blocks = nn.ModuleList([
-            MiniMaxH3VaceBlock(hidden_size, num_attention_heads, attention_head_dim, ffn_hidden_size, time_embed_dim, adaln_out_features, norm_eps, qk_norm_eps, block_id=i)
-            for i in self.vace_layers
+            MiniMaxH3VaceBlock(hidden_size, num_attention_heads, attention_head_dim, ffn_hidden_size, time_embed_dim, adaln_out_features, norm_eps, qk_norm_eps)
+            for _ in self.vace_layers
         ])
 
-        # vace patch embedding
-        self.vace_patch_embedding = nn.Linear(vace_in_dim, hidden_size, bias=True)
-
-    def init_from_dit(self, dit):
-        """Warm-start the VACE blocks from the corresponding backbone blocks."""
+    def init_from_dit(self, dit: MiniMaxH3DiT):
+        """Warm-start every module from the backbone. `after_proj` stays
+        zero-initialized, so the control signal contributes nothing at first."""
+        self.video_patch_proj.load_state_dict(dit.video_patch_proj.state_dict())
+        self.time_embedder.load_state_dict(dit.time_embedder.state_dict())
         for layer_id, block in zip(self.vace_layers, self.vace_blocks):
-            state_dict = dit.blocks[layer_id].state_dict()
-            block.load_state_dict(state_dict, strict=False)
+            block.load_state_dict(dit.blocks[layer_id].state_dict(), strict=False)
 
     def forward(
         self,
-        x, vace_context, t_emb, combined_indices, rope_freqs, img_pos,
+        vace_context, rope_freqs, img_pos,
         use_gradient_checkpointing: bool = False,
         use_gradient_checkpointing_offload: bool = False,
     ):
         # The control tokens share the target video's positions in the packed
-        # sequence, so RoPE frequencies and AdaLN indices are gathered from there.
-        c = self.vace_patch_embedding(vace_context)
-        ctrl_pos = img_pos[:c.shape[0]]
-        combined_indices = combined_indices[ctrl_pos]
-        rope_freqs = rope_freqs[ctrl_pos]
+        # sequence, so RoPE frequencies are gathered from there.
+        c = self.video_patch_proj(vace_context)
+        rope_freqs = rope_freqs[img_pos[:c.shape[0]]]
         cu_seqlens = torch.tensor([0, c.shape[0]], dtype=torch.int32, device=c.device)
         max_seqlen = c.shape[0]
 
-        x = x[ctrl_pos]
+        # The control video is a clean signal, not a noisy latent, so the bypass is
+        # always modulated with timestep 0. `t_emb` then holds a single row, and the
+        # AdaLN indices select its video modality for every control token.
+        t_emb = self.time_embedder(torch.zeros(1, dtype=torch.float32, device=c.device), dtype=c.dtype)
+        combined_indices = torch.zeros(c.shape[0], dtype=torch.long, device=c.device)
+
         hints = []
         for block in self.vace_blocks:
             hint, c = gradient_checkpoint_forward(
                 block,
                 use_gradient_checkpointing,
                 use_gradient_checkpointing_offload,
-                c, x,
+                c,
                 t_emb=t_emb,
                 combined_indices=combined_indices,
                 rope_freqs=rope_freqs,

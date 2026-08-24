@@ -111,6 +111,7 @@ class MiniMaxH3Pipeline(BasePipeline):
         # VACE
         vace_video: list[Image.Image] = None,
         vace_scale: float = 1.0,
+        vace_log_variance: bool = False,
         progress_bar_cmd=tqdm,
         # Template inputs
         text_embedding: torch.Tensor = None,
@@ -151,7 +152,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             "retake_video": retake_video, "frame_regions_to_retake": frame_regions_to_retake,
             "retake_audio": (retake_audio, retake_audio_sample_rate) if retake_audio is not None else None, "seconds_regions_to_retake": seconds_regions_to_retake,
             "imgvid_cond_noise_aug": self.imgvid_cond_noise_aug, "audio_cond_noise_aug": self.audio_cond_noise_aug,
-            "vace_video": vace_video, "vace_scale": vace_scale,
+            "vace_video": vace_video, "vace_scale": vace_scale, "vace_log_variance": vace_log_variance,
             "text_embedding": text_embedding,
         }
 
@@ -866,6 +867,7 @@ def model_fn_minimax_h3(
     vace=None,
     vace_context=None,
     vace_scale=1.0,
+    vace_log_variance=False,
     use_gradient_checkpointing=False,
     use_gradient_checkpointing_offload=False,
     **kwargs,
@@ -936,6 +938,7 @@ def model_fn_minimax_h3(
         vace=vace,
         vace_context=vace_context,
         vace_scale=vace_scale,
+        vace_log_variance=vace_log_variance,
     )
 
     v_video_rows = v_video_rows[cond_rows_count:]

@@ -7,6 +7,7 @@
 *.pkl
 *.safetensors
 *.pth
+*.mp4
 *.ckpt
 *.pt
 *.bin

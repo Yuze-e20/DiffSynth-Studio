@@ -29,6 +29,7 @@ class MiniMaxH3TrainingModule(DiffusionTrainingModule):
         resume_from_checkpoint=None, remove_prefix_in_ckpt=None,
         silent_on_missing_audio=False,
         vace_layers=None,
+        vace_log_variance=False,
         device="cpu",
         task="sft",
     ):
@@ -70,6 +71,7 @@ class MiniMaxH3TrainingModule(DiffusionTrainingModule):
 
         # Store other configs
         self.silent_on_missing_audio = silent_on_missing_audio
+        self.vace_log_variance = vace_log_variance
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.use_gradient_checkpointing_offload = use_gradient_checkpointing_offload
         self.extra_inputs = extra_inputs.split(",") if extra_inputs is not None else []
@@ -122,6 +124,7 @@ class MiniMaxH3TrainingModule(DiffusionTrainingModule):
             "imgvid_cond_noise_aug": self.pipe.imgvid_cond_noise_aug,
             "audio_cond_noise_aug": self.pipe.audio_cond_noise_aug,
             "vace_video": None,
+            "vace_log_variance": self.vace_log_variance,
             # Please do not modify the following parameters
             # unless you clearly know what this will cause.
             "cfg_scale": 1,
@@ -151,6 +154,7 @@ def minimax_h3_parser():
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     parser.add_argument("--silent_on_missing_audio", default=False, action="store_true", help="Whether to use silent audio as a fallback when no audio track is present in the video data.")
     parser.add_argument("--vace_layers", type=str, default=None, help="Indices of the DiT blocks that VACE hints are injected into, comma-separated. Only used when training VACE from scratch.")
+    parser.add_argument("--vace_log_variance", default=False, action="store_true", help="Whether to print the variance of each VACE hint and of the backbone hidden states it is added to.")
     return parser
 
 
@@ -225,6 +229,7 @@ if __name__ == "__main__":
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
         silent_on_missing_audio=args.silent_on_missing_audio,
         vace_layers=args.vace_layers,
+        vace_log_variance=args.vace_log_variance,
         task=args.task,
         device="cpu" if (args.initialize_model_on_cpu or args.enable_model_cpu_offload) else accelerator.device,
     )
