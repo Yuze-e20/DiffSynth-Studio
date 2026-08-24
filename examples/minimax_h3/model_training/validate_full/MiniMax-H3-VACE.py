@@ -35,13 +35,13 @@ pipe.vace = MiniMaxH3VaceModel(
     hidden_size=pipe.dit.hidden_size,
     num_attention_heads=pipe.dit.num_attention_heads,
 ).to(dtype=pipe.torch_dtype, device=pipe.device)
-state_dict = load_state_dict("/mnt/nas3/sunyuzework/myown/DiffSynth-Studio/models/train/MiniMax-H3-VACE-720p-nocaption/step-6800.safetensors")
+state_dict = load_state_dict("/mnt/nas3/sunyuzework/myown/DiffSynth-Studio/models/train/MiniMax-H3-VACE-720p-nocaption/step-7000.safetensors")
 pipe.vace.load_state_dict(state_dict)
 
-lineart_video_path = "/mnt/nas3/sunyuzework/myown/DiffSynth-Studio/data/diffsynth_example_dataset/minimax_h3/MiniMax-H3-Ref2VA/video_lineart.mp4"
-# lineart_video_path = "/mnt/nas3/sunyuzework/Diffutoon-2/data/xinhaicheng_39_lineart/500.mp4"
+# lineart_video_path = "/mnt/nas3/sunyuzework/myown/DiffSynth-Studio/data/diffsynth_example_dataset/minimax_h3/MiniMax-H3-Ref2VA/video_lineart.mp4"
+lineart_video_path = "/mnt/nas3/sunyuzework/Diffutoon-2/data/xinhaicheng_39_lineart/1.mp4"
 
-max_pixels, num_frames = 1044480, 124
+max_pixels, num_frames = 1044480, 39
 
 vace_video = UnifiedDataset.default_video_operator(
     base_path="", max_pixels=max_pixels, height=None, width=None,
@@ -56,11 +56,11 @@ prompt = "subject_definitions:\n<Video 1> is the source line-art video that defi
 video, audio = pipe(
     prompt=prompt,
     height=height, width=width, num_frames=num_frames,
-    num_inference_steps=50, seed=42, cfg_scale=1,
+    num_inference_steps=50, seed=42, cfg_scale=3,
     vace_video=vace_video,
 )
 write_video_audio(
-    video=video, audio=audio, output_path="minimax_h3_vace_720p-6800-example-124-cfg1.mp4",
+    video=video, audio=audio, output_path="minimax_h3_vace_720p-7000-cfg3.mp4",
     fps=24, audio_sample_rate=pipe.audio_vae.sample_rate,
 )
 print("saved minimax_h3_vace_full.mp4", "frames:", len(video), "audio:", tuple(audio.shape))

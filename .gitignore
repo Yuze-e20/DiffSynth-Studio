@@ -170,7 +170,7 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
-
+/mnt/nas3/sunyuzework/myown/DiffSynth-Studio/examples/minimax_h3/model_training/validate_full/MiniMax-H3-VACE.py
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
