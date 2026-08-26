@@ -38,10 +38,10 @@ pipe.vace = MiniMaxH3VaceModel(
 state_dict = load_state_dict("/mnt/nas3/sunyuzework/myown/DiffSynth-Studio/models/train/MiniMax-H3-VACE-720p-nocaption/step-9200.safetensors")
 pipe.vace.load_state_dict(state_dict)
 
-# lineart_video_path = "/mnt/nas3/sunyuzework/myown/DiffSynth-Studio/data/diffsynth_example_dataset/minimax_h3/MiniMax-H3-Ref2VA/video_lineart.mp4"
-lineart_video_path = "/mnt/nas3/sunyuzework/Diffutoon-2/data/xinhaicheng_39_lineart/1.mp4"
+lineart_video_path = "/mnt/nas3/sunyuzework/myown/DiffSynth-Studio/data/diffsynth_example_dataset/minimax_h3/MiniMax-H3-Ref2VA/video_lineart.mp4"
+# lineart_video_path = "/mnt/nas3/sunyuzework/Diffutoon-2/data/xinhaicheng_39_lineart/1.mp4"
 
-max_pixels, num_frames = 1044480, 39
+max_pixels, num_frames = 1044480, 124
 
 vace_video = UnifiedDataset.default_video_operator(
     base_path="", max_pixels=max_pixels, height=None, width=None,
@@ -60,7 +60,7 @@ video, audio = pipe(
     vace_video=vace_video,
 )
 write_video_audio(
-    video=video, audio=audio, output_path="minimax_h3_vace_720p-9200-cfg1.mp4",
+    video=video, audio=audio, output_path="minimax_h3_vace_720p-example-9200-cfg1-124.mp4",
     fps=24, audio_sample_rate=pipe.audio_vae.sample_rate,
 )
 print("saved minimax_h3_vace_full.mp4", "frames:", len(video), "audio:", tuple(audio.shape))

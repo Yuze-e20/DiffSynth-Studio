@@ -20,8 +20,9 @@ class MiniMaxH3VaceModel(nn.Module):
     """The VACE bypass, which encodes the control video into per-layer hints.
 
     The bypass only reads the control latents, never the noisy video, and is always
-    modulated with timestep 0. Its hints are therefore constant over the sampling
-    loop and only need to be computed once. Every module mirrors its counterpart in
+    modulated at `cond_noise_aug` (the clean-conditioning timestep). Its hints are
+    therefore constant over the sampling loop and only need to be computed once.
+    Every module mirrors its counterpart in
     the backbone so that `init_from_dit` can warm-start all of them: `video_patch_proj`
     embeds the control latents, `time_embedder` modulates them and `vace_blocks`
     produce the hints."""
@@ -40,10 +41,14 @@ class MiniMaxH3VaceModel(nn.Module):
         adaln_out_features=96768,
         norm_eps=1e-5,
         qk_norm_eps=1e-5,
+        cond_noise_aug=0.999,
     ):
         super().__init__()
         self.vace_layers = sorted(vace_layers)
         self.vace_in_dim = vace_in_dim
+        # Timestep the control latents are modulated at; see `forward`. Not a
+        # parameter, so it does not change the checkpoint layout.
+        self.cond_noise_aug = cond_noise_aug
         self.vace_layers_mapping = {i: n for n, i in enumerate(self.vace_layers)}
 
         # These two mirror the backbone's modules of the same name, so that
@@ -79,9 +84,18 @@ class MiniMaxH3VaceModel(nn.Module):
         max_seqlen = c.shape[0]
 
         # The control video is a clean signal, not a noisy latent, so the bypass is
-        # always modulated with timestep 0. `t_emb` then holds a single row, and the
-        # AdaLN indices select its video modality for every control token.
-        t_emb = self.time_embedder(torch.zeros(1, dtype=torch.float32, device=c.device), dtype=c.dtype)
+        # modulated at the level the backbone uses for clean conditioning rows.
+        # MiniMax-H3's flow-matching convention is `x_t = t*x0 + (1-t)*noise`, so
+        # t=1 is clean and t=0 is pure noise: passing 0 here told every control
+        # block the control latents were pure noise, i.e. the exact opposite of
+        # what they are, and selected the AdaLN modulation the backbone learned for
+        # "ignore this signal". 0.999 matches `pipe.imgvid_cond_noise_aug`, the
+        # level the backbone was trained to read clean conditioning latents at.
+        # `t_emb` holds a single row, and the AdaLN indices select its video
+        # modality (tag 0) for every control token.
+        t_emb = self.time_embedder(
+            torch.full((1,), self.cond_noise_aug, dtype=torch.float32, device=c.device), dtype=c.dtype
+        )
         combined_indices = torch.zeros(c.shape[0], dtype=torch.long, device=c.device)
 
         hints = []

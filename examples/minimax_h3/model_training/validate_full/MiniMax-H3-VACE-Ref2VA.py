@@ -21,12 +21,12 @@ pipe = MiniMaxH3Pipeline.from_pretrained(
     torch_dtype=torch.bfloat16,
     device="cuda",
     model_configs=[
-        ModelConfig(model_id="MiniMax/MiniMax-H3", origin_file_pattern="FL2VA/text_encoder/model*.safetensors", **vram_config),
-        ModelConfig(model_id="MiniMax/MiniMax-H3", origin_file_pattern="FL2VA/transformer/model*.safetensors", **vram_config),
-        ModelConfig(model_id="MiniMax/MiniMax-H3", origin_file_pattern="FL2VA/video_vae/source/model.safetensors", **vram_config),
-        ModelConfig(model_id="MiniMax/MiniMax-H3", origin_file_pattern="FL2VA/audio_vae/model.safetensors", **vram_config),
+        ModelConfig(model_id="MiniMax/MiniMax-H3", origin_file_pattern="Ref2VA/text_encoder/model*.safetensors", **vram_config),
+        ModelConfig(model_id="MiniMax/MiniMax-H3", origin_file_pattern="Ref2VA/transformer/model*.safetensors", **vram_config),
+        ModelConfig(model_id="MiniMax/MiniMax-H3", origin_file_pattern="Ref2VA/video_vae/source/model.safetensors", **vram_config),
+        ModelConfig(model_id="MiniMax/MiniMax-H3", origin_file_pattern="Ref2VA/audio_vae/model.safetensors", **vram_config),
     ],
-    processor_config=ModelConfig(model_id="MiniMax/MiniMax-H3", origin_file_pattern="FL2VA/processor/"),
+    processor_config=ModelConfig(model_id="MiniMax/MiniMax-H3", origin_file_pattern="Ref2VA/processor/"),
     vram_limit=torch.cuda.mem_get_info("cuda")[1] / (1024 ** 3) - 5,
 )
 # `vace_layers` must match the value used during training.
@@ -35,13 +35,13 @@ pipe.vace = MiniMaxH3VaceModel(
     hidden_size=pipe.dit.hidden_size,
     num_attention_heads=pipe.dit.num_attention_heads,
 ).to(dtype=pipe.torch_dtype, device=pipe.device)
-state_dict = load_state_dict("/mnt/nas3/sunyuzework/myown/DiffSynth-Studio/models/train/MiniMax-H3-VACE-720p-nocaption/step-9200.safetensors")
+state_dict = load_state_dict("/mnt/nas3/sunyuzework/myown/DiffSynth-Studio/models/train/MiniMax-H3-VACE-480p-nocaption-Ref2VA/step-200.safetensors")
 pipe.vace.load_state_dict(state_dict)
 
 # lineart_video_path = "/mnt/nas3/sunyuzework/myown/DiffSynth-Studio/data/diffsynth_example_dataset/minimax_h3/MiniMax-H3-Ref2VA/video_lineart.mp4"
 lineart_video_path = "/mnt/nas3/sunyuzework/Diffutoon-2/data/xinhaicheng_39_lineart/1.mp4"
 
-max_pixels, num_frames = 1044480, 39
+max_pixels, num_frames = 399360, 39
 
 vace_video = UnifiedDataset.default_video_operator(
     base_path="", max_pixels=max_pixels, height=None, width=None,
@@ -60,7 +60,7 @@ video, audio = pipe(
     vace_video=vace_video,
 )
 write_video_audio(
-    video=video, audio=audio, output_path="minimax_h3_vace_720p-9200-cfg1.mp4",
+    video=video, audio=audio, output_path="new480p-ref/minimax_h3_vace_480pcfg1.mp4",
     fps=24, audio_sample_rate=pipe.audio_vae.sample_rate,
 )
 print("saved minimax_h3_vace_full.mp4", "frames:", len(video), "audio:", tuple(audio.shape))
