@@ -109,6 +109,11 @@ class MiniMaxH3Pipeline(BasePipeline):
         tile_overlap: int = 64,
         use_gradient_checkpointing: bool = False,
         use_gradient_checkpointing_offload: bool = False,
+        # Video (+ Audio) to Video + Audio
+        input_video: list[Image.Image] = None,
+        input_audio: torch.Tensor = None,
+        input_audio_sample_rate: int = 32000,
+        denoising_strength: float = 1.0,
         # Keyframe to Video
         keyframes: list[Image.Image] = None,
         keyframe_indices: list[int] = None,
@@ -139,6 +144,16 @@ class MiniMaxH3Pipeline(BasePipeline):
         `keyframes` (FL2AV) is a list of PIL images with `keyframe_indices` in
         {0, -1}; both are resized onto the target canvas.
 
+        `input_video` (V2VA) re-noises a source clip to `denoising_strength` and denoises from
+        there, so the result keeps the source layout and motion; frames are resized onto the
+        target canvas, trimmed to `num_frames`, and short clips are padded with the last frame.
+        `denoising_strength` positions the schedule *before* `flow_shift`, and at shift 12 that
+        curve is steep -- 0.2 already puts noise level 0.75 on the video latents -- so useful
+        values sit around 0.1-0.2, well below the usual range. The step count is unchanged.
+        Pass `input_audio` (a [C, L] waveform at `input_audio_sample_rate`, e.g. the clip's own
+        soundtrack) to seed the audio branch the same way — left None the audio is generated
+        from pure noise, which at low `denoising_strength` leaves it few steps to converge.
+
         `references` (Ref2AV) is a list of dicts in request order:
 
             {"type": "image",       "image": PIL.Image}
@@ -149,8 +164,10 @@ class MiniMaxH3Pipeline(BasePipeline):
 
         Input contract: `video` frame lists must ALREADY. be 24fps the pipeline never resamples frame rate.
         """
-        self.scheduler.set_timesteps(num_inference_steps, shift=flow_shift)
-        self.scheduler_audio.set_timesteps(num_inference_steps, shift=audio_flow_shift)
+        # Both branches share one `denoising_strength`: training pairs the two schedulers at the
+        # same step index, so their starting points have to stay aligned to remain in-distribution.
+        self.scheduler.set_timesteps(num_inference_steps, denoising_strength=denoising_strength, shift=flow_shift)
+        self.scheduler_audio.set_timesteps(num_inference_steps, denoising_strength=denoising_strength, shift=audio_flow_shift)
 
         inputs_posi = {"prompt": prompt}
         inputs_nega = {"negative_prompt": negative_prompt}
@@ -161,6 +178,8 @@ class MiniMaxH3Pipeline(BasePipeline):
             "tiled": tiled, "tile_size": tile_size, "tile_overlap": tile_overlap,
             "use_gradient_checkpointing": use_gradient_checkpointing,
             "use_gradient_checkpointing_offload": use_gradient_checkpointing_offload,
+            "input_video": input_video,
+            "input_audio": (input_audio, input_audio_sample_rate) if input_audio is not None else None,
             "keyframes": keyframes, "keyframe_indices": keyframe_indices,
             "references": references, "ref_image_short_edge": ref_image_short_edge, "ref_video_short_edge": ref_video_short_edge, "ref_video_max_pixels": ref_video_max_pixels,
             "control_video": control_video, "control_scale": control_scale,
@@ -325,30 +344,39 @@ class MiniMaxH3Unit_PromptEmbedder(PipelineUnit):
 class MiniMaxH3Unit_InputVideoEmbedder(PipelineUnit):
     def __init__(self):
         super().__init__(
-            input_params=("input_video",),
+            input_params=("input_video", "video_latents", "height", "width", "num_frames", "tiled", "tile_size", "tile_overlap"),
             output_params=("video_latents", "input_latents"),
             onload_model_names=("video_vae",)
         )
 
-    def process(self, pipe: MiniMaxH3Pipeline, input_video):
-        if input_video is None or not pipe.scheduler.training:
+    def process(self, pipe: MiniMaxH3Pipeline, input_video, video_latents, height, width, num_frames, tiled, tile_size, tile_overlap):
+        if input_video is None:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
-        frames_tensor = pipe.preprocess_video(input_video, torch_dtype=torch.float32, min_value=0, device=pipe.device)
-        latents = pipe.video_vae.encode_video(frames_tensor, dtype=pipe.torch_dtype).to(pipe.torch_dtype)
-        return {"video_latents": latents, "input_latents": latents}
+        if pipe.scheduler.training:
+            frames_tensor = pipe.preprocess_video(input_video, torch_dtype=torch.float32, min_value=0, device=pipe.device)
+            latents = pipe.video_vae.encode_video(frames_tensor, dtype=pipe.torch_dtype).to(pipe.torch_dtype)
+            return {"video_latents": latents, "input_latents": latents}
+        # Video-to-video: encode the source clip, then re-noise it to the first timestep.
+        assert len(input_video) > 0, "input_video must contain at least one frame"
+        frames = [f.convert("RGB").resize((width, height), Image.LANCZOS) for f in input_video[:num_frames]]
+        frames += [frames[-1]] * (num_frames - len(frames))
+        frames_tensor = pipe.preprocess_video(frames, torch_dtype=torch.float32, min_value=0, device=pipe.device)
+        latents = pipe.video_vae.encode_video(frames_tensor, dtype=pipe.torch_dtype, tiled=tiled, tile_size=tile_size, tile_overlap=tile_overlap).to(device=pipe.device, dtype=pipe.torch_dtype)
+        assert latents.shape == video_latents.shape, f"input_video latents {tuple(latents.shape)} do not match the target shape {tuple(video_latents.shape)}"
+        return {"video_latents": pipe.scheduler.add_noise(latents, video_latents, pipe.scheduler.timesteps[0])}
 
 
 class MiniMaxH3Unit_InputAudioEmbedder(PipelineUnit):
     def __init__(self):
         super().__init__(
-            input_params=("input_audio",),
+            input_params=("input_audio", "audio_latents"),
             output_params=("audio_latents", "audio_input_latents"),
             onload_model_names=("audio_vae",)
         )
 
-    def process(self, pipe: MiniMaxH3Pipeline, input_audio):
-        if input_audio is None or not pipe.scheduler.training:
+    def process(self, pipe: MiniMaxH3Pipeline, input_audio, audio_latents):
+        if input_audio is None:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
         waveform, sample_rate = input_audio
@@ -356,7 +384,16 @@ class MiniMaxH3Unit_InputAudioEmbedder(PipelineUnit):
         assert waveform.dim() == 2, "waveform must be in shape (C, T)"
         waveform = resample_waveform(convert_to_stereo(waveform).float(), sample_rate, pipe.audio_vae.sample_rate) # [C, T]
         latents = pipe.audio_vae.encode_audio(waveform[:2].to(pipe.device), dtype=pipe.torch_dtype).to(pipe.torch_dtype)  # [C, 32, T]
-        return {"audio_latents": latents, "audio_input_latents": latents}
+        if pipe.scheduler.training:
+            return {"audio_latents": latents, "audio_input_latents": latents}
+        # Audio-to-audio: trim / pad to the target latent length, then re-noise to the first timestep.
+        assert latents.shape[:-1] == audio_latents.shape[:-1], f"input_audio latents {tuple(latents.shape)} do not match the target shape {tuple(audio_latents.shape)}"
+        audio_latent_t = audio_latents.shape[-1]
+        if latents.shape[-1] > audio_latent_t:
+            latents = latents[..., :audio_latent_t]
+        elif latents.shape[-1] < audio_latent_t:
+            latents = torch.cat([latents, latents[..., -1:].repeat(1, 1, audio_latent_t - latents.shape[-1])], dim=-1)
+        return {"audio_latents": pipe.scheduler_audio.add_noise(latents, audio_latents, pipe.scheduler_audio.timesteps[0])}
 
 
 class MiniMaxH3Unit_VideoRetakeEmbedder(PipelineUnit):
