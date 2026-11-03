@@ -4,6 +4,12 @@ import torch.nn as nn
 from ..core.gradient import gradient_checkpoint_forward
 from .minimax_h3_dit import MiniMaxH3DiTBlock, _PATCH_H, _PATCH_T, _PATCH_W
 
+# Latent channels a control-only checkpoint reads. Both the published Fun-Controlnet-Union
+# weights and anything trained from them use this. Callers that must size control rows
+# before a ControlNet is loaded (the data-process stage builds them with only the video VAE
+# in memory) fall back to this value.
+DEFAULT_CONTROL_IN_DIM = 49
+
 
 class MiniMaxH3ControlNetBlock(MiniMaxH3DiTBlock):
     def __init__(self, hidden_size, num_attention_heads, attention_head_dim, ffn_hidden_size, time_embed_dim, adaln_out_features, norm_eps, qk_norm_eps, block_id=0):
@@ -32,7 +38,7 @@ class MiniMaxH3ControlNet(nn.Module):
     def __init__(
         self,
         control_layers: tuple = (0, 10, 20, 30, 40),
-        control_in_dim: int = 49,
+        control_in_dim: int = DEFAULT_CONTROL_IN_DIM,
         control_apply_audio: bool = False,
         hidden_size: int = 5376,
         num_attention_heads: int = 56,
@@ -80,8 +86,39 @@ class MiniMaxH3ControlNet(nn.Module):
         expected = self.patch_columns()
         if control_rows.shape[-1] != expected:
             raise ValueError(f"control_rows carry {control_rows.shape[-1]} columns but control_in_dim={self.control_in_dim} expects {expected}")
-        if control_rows.shape[0] != img_pos.shape[0]:
+        n_cond = img_pos.shape[0] - control_rows.shape[0]
+        if n_cond < 0:
             raise ValueError(f"control_rows hold {control_rows.shape[0]} rows but the packed sequence has {img_pos.shape[0]} video rows; one control row per video row is required, in the same order")
+        if n_cond > 0:
+            # A keyframe packs its condition rows at the front of img_pos, and the control
+            # encoder only emits rows for the video latents. Those condition rows are
+            # dropped from this branch's sequence rather than padded: cu_seqlens spans the
+            # whole packed sequence as one attention segment, so anything left on them
+            # would mix into every control row at every block, and masking the hint at the
+            # end cannot undo that. Each surviving row keeps its own position values -- rope
+            # is per row through rope_freqs and the adaln lookup per row through
+            # combined_indices -- so text, audio and video see exactly the positions the
+            # main branch gives them.
+            seq_len = embeddings.shape[0]
+            mask = torch.ones(seq_len, dtype=torch.bool, device=embeddings.device)
+            mask[img_pos[:n_cond]] = False
+            keep = mask.nonzero(as_tuple=True)[0]
+            remap = torch.full((seq_len,), -1, dtype=torch.long, device=embeddings.device)
+            remap[keep] = torch.arange(keep.shape[0], device=embeddings.device)
+            hints = self.forward(
+                embeddings[keep], control_rows, remap[img_pos[n_cond:]], remap[audio_pos],
+                t_emb=t_emb, combined_indices=combined_indices[keep], rope_freqs=rope_freqs[keep],
+                cu_seqlens=torch.tensor([0, int(cu_seqlens[1]) - n_cond, keep.shape[0]], dtype=cu_seqlens.dtype, device=cu_seqlens.device),
+                max_seqlen=int(cu_seqlens[1]) - n_cond,
+                use_gradient_checkpointing=use_gradient_checkpointing,
+                use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+            )
+            out = []
+            for hint in hints:
+                full = hint.new_zeros((seq_len, hint.shape[-1]))
+                full.index_copy_(0, keep, hint)
+                out.append(full)
+            return tuple(out)
         control_embeds = self.control_patch_proj(control_rows.to(self.control_patch_proj.weight.dtype))
         c = embeddings.index_copy(0, img_pos, control_embeds.to(embeddings.dtype))
         for block in self.blocks:

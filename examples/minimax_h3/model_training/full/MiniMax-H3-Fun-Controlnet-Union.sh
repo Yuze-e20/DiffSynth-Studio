@@ -14,7 +14,7 @@ accelerate launch examples/minimax_h3/model_training/train.py \
   --learning_rate 1e-5 \
   --num_epochs 1 \
   --remove_prefix_in_ckpt "pipe.controlnet." \
-  --output_path "./models/train/MiniMax-H3-Fun-Controlnet-Union-split-cache-720p-39" \
+  --output_path "./models/train/MiniMax-H3-Fun-Controlnet-Union-split-cache-720p-39-sigma30" \
   --trainable_models "controlnet" \
   --use_gradient_checkpointing \
   --task "sft:data_process" \
@@ -22,7 +22,7 @@ accelerate launch examples/minimax_h3/model_training/train.py \
 
 # stage 2 (train)
 accelerate launch --config_file /mnt/nas3/sunyuzework/Diffutoon-2/DiffSynth-Studio/examples/minimax_h3/model_training/full/accelerate_config_zero2.yaml examples/minimax_h3/model_training/train.py \
-  --dataset_base_path ./models/train/MiniMax-H3-Fun-Controlnet-Union-split-cache-720p-39 \
+  --dataset_base_path ./models/train/MiniMax-H3-Fun-Controlnet-Union-split-cache-720p-39-sigma30 \
   --data_file_keys "video,input_audio" \
   --extra_inputs "input_audio" \
   --max_pixels 1032192 \
@@ -33,7 +33,7 @@ accelerate launch --config_file /mnt/nas3/sunyuzework/Diffutoon-2/DiffSynth-Stud
   --num_epochs 100 \
   --save_steps 200 \
   --remove_prefix_in_ckpt "pipe.controlnet." \
-  --output_path "./models/train/MiniMax-H3-Fun-Controlnet-Union_full-720p-39" \
+  --output_path "./models/train/MiniMax-H3-Fun-Controlnet-Union_full-720p-39-sigma30" \
   --preset_lora_path /root/models/DiffSynth-Studio/MiniMax-H3-TrainingAdapter/model.safetensors \
   --preset_lora_model dit \
   --trainable_models "controlnet" \

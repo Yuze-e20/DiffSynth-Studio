@@ -16,9 +16,58 @@ from ..models.minimax_h3_text_encoder import (
 )
 from ..models.minimax_h3_video_vae import MiniMaxH3VideoVAE
 from ..models.minimax_h3_audio_vae import MiniMaxH3AudioVAE
-from ..models.minimax_h3_controlnet import MiniMaxH3ControlNet
+from ..models.minimax_h3_controlnet import MiniMaxH3ControlNet, DEFAULT_CONTROL_IN_DIM
 from ..utils.data.audio import convert_to_stereo, resample_waveform
 from ..utils.lora.minimax_h3 import MiniMaxH3LoRALoader
+
+
+class MiniMaxH3MultiControlNet(torch.nn.Module):
+    """Holds one or more ControlNets whose block hints are summed into the DiT.
+
+    The DiT injects hints as a plain additive residual (`hidden = hidden + hint`),
+    so several ControlNets compose by adding their per-layer hints. Each branch
+    keeps its own `control_video` and `control_scale`, and branches are free to
+    target different `control_layers` -- hints are merged by DiT block id and
+    summed only where two branches land on the same block.
+
+    Note that every branch is trained to act alone, so its hint magnitude is
+    calibrated for a solo residual. Summing N branches at scale 1.0 over-drives
+    the backbone; start around 1/N per branch and tune from there.
+    """
+
+    def __init__(self, models):
+        super().__init__()
+        if not isinstance(models, (list, tuple)):
+            models = [models]
+        self.models = torch.nn.ModuleList(models)
+
+    def __len__(self):
+        return len(self.models)
+
+    def __iter__(self):
+        return iter(self.models)
+
+    def __getitem__(self, index):
+        return self.models[index]
+
+    def broadcast(self, value, name):
+        """Normalize a per-branch argument to one entry per ControlNet."""
+        if not isinstance(value, (list, tuple)):
+            return [value] * len(self.models)
+        if len(value) != len(self.models):
+            raise ValueError(f"{name} holds {len(value)} entries but {len(self.models)} ControlNets are loaded; pass one per ControlNet or a single shared value")
+        return list(value)
+
+    def merge_hints(self, hints_per_model, scales):
+        """Sum per-branch hints into a {dit_block_id: hint} mapping."""
+        merged = {}
+        for model, hints, scale in zip(self.models, hints_per_model, scales):
+            if hints is None:
+                continue
+            for block_id, hint_id in model.control_layers_mapping.items():
+                hint = hints[hint_id] * scale
+                merged[block_id] = hint if block_id not in merged else merged[block_id] + hint
+        return merged
 
 
 class MiniMaxH3Pipeline(BasePipeline):
@@ -82,7 +131,18 @@ class MiniMaxH3Pipeline(BasePipeline):
         pipe.dit = model_pool.fetch_model("minimax_h3_dit")
         pipe.video_vae = model_pool.fetch_model("minimax_h3_video_vae")
         pipe.audio_vae = model_pool.fetch_model("minimax_h3_audio_vae")
-        pipe.controlnet = model_pool.fetch_model("minimax_h3_controlnet")
+        controlnets = model_pool.fetch_model("minimax_h3_controlnet", index="all")
+        if isinstance(controlnets, list) and len(controlnets) > 1:
+            # Only wrap when several ControlNets are actually loaded. A single one stays
+            # a bare module so that `--remove_prefix_in_ckpt pipe.controlnet.` in the
+            # training scripts keeps producing directly loadable checkpoints.
+            pipe.controlnet = MiniMaxH3MultiControlNet(controlnets)
+            # `load_models_to_device` dispatches on this flag per named child, so the
+            # wrapper has to advertise what its branches support.
+            if getattr(controlnets[0], "vram_management_enabled", False):
+                pipe.controlnet.vram_management_enabled = True
+        else:
+            pipe.controlnet = controlnets[0] if isinstance(controlnets, list) else controlnets
         if processor_config is not None:
             processor_config.download_if_necessary()
             pipe.processor = AutoProcessor.from_pretrained(processor_config.path)
@@ -122,9 +182,10 @@ class MiniMaxH3Pipeline(BasePipeline):
         ref_image_short_edge: int = 2048,
         ref_video_short_edge: int = 768,
         ref_video_max_pixels: int = 768 * 1344,
-        # ControlNet
-        control_video: list[Image.Image] = None,
-        control_scale: float = 1.0,
+        # ControlNet. With several ControlNets loaded, pass one frame list and one
+        # scale per branch: control_video=[frames_a, frames_b], control_scale=[0.5, 0.5].
+        control_video: list[Image.Image] | list[list[Image.Image]] = None,
+        control_scale: float | list[float] = 1.0,
         # Video / Audio Retake
         retake_video: list[Image.Image] = None,
         frame_regions_to_retake: list[tuple[float, float]] = None,
@@ -396,6 +457,27 @@ class MiniMaxH3Unit_InputAudioEmbedder(PipelineUnit):
         return {"audio_latents": pipe.scheduler_audio.add_noise(latents, audio_latents, pipe.scheduler_audio.timesteps[0])}
 
 
+VAE_CLIP_FRAMES = 17        # frames per VAE clip
+VAE_CLIP_LATENTS = 5        # latents each clip encodes to
+VAE_RATIO_T = 4             # frames per latent after the first of each clip
+
+
+def latents_fully_covered(frames, clip_frames=VAE_CLIP_FRAMES, latents_per_clip=VAE_CLIP_LATENTS, ratio_t=VAE_RATIO_T):
+    """How many leading latents the first `frames` frames fully determine.
+
+    A clip of `clip_frames` frames encodes to `latents_per_clip` latents as
+    1 + ratio_t + ratio_t + ...: latent 0 sees frame 0 alone, every later one
+    `ratio_t` frames. Flooring on `clip_frames` instead only recognises whole
+    clips, so any context shorter than one clip rounds down to nothing.
+    """
+    n = 0
+    while True:
+        clip_idx, within = divmod(n, latents_per_clip)
+        if clip_idx * clip_frames + (0 if within == 0 else ratio_t * within) >= frames:
+            return n
+        n += 1
+
+
 class MiniMaxH3Unit_VideoRetakeEmbedder(PipelineUnit):
     def __init__(self):
         super().__init__(
@@ -420,10 +502,12 @@ class MiniMaxH3Unit_VideoRetakeEmbedder(PipelineUnit):
         if padded_frames > 0:
             regions.append((num_frames - padded_frames, num_frames))
         clip_frames, latents_per_clip = pipe.video_vae.clip_length, pipe.video_vae.tokens_chunk_size
+        ratio_t = pipe.video_vae.vae_ratio_t
         mask = torch.zeros(latents.shape[2], dtype=pipe.torch_dtype, device=pipe.device)  # 1 = regenerate
         for start, end in regions:
             if end > start:
-                mask[max(0, math.floor(start / clip_frames)) * latents_per_clip: math.ceil(end / clip_frames) * latents_per_clip] = 1
+                first = latents_fully_covered(start, clip_frames, latents_per_clip, ratio_t)
+                mask[first: math.ceil(end / clip_frames) * latents_per_clip] = 1
         return {"input_latents_video": latents, "denoise_mask_video": mask.view(1, 1, -1, 1, 1).expand(-1, -1, -1, *latents.shape[-2:])}
 
 
@@ -891,6 +975,17 @@ class MiniMaxH3Unit_ControlNetEncoder(PipelineUnit):
         frames_tensor = pipe.preprocess_video(frames, torch_dtype=torch.float32, min_value=0, device=pipe.device)
         return pipe.video_vae.encode_video(frames_tensor, dtype=pipe.torch_dtype, tiled=tiled, tile_size=tile_size, tile_overlap=tile_overlap).to(device=pipe.device, dtype=pipe.torch_dtype)
 
+    def encode_one_branch(self, pipe: MiniMaxH3Pipeline, control_video, control_in_dim, height, width, num_frames, tiled, tile_size, tile_overlap):
+        control_latents = self.encode_video_at_mode(pipe, control_video, height, width, num_frames, tiled, tile_size, tile_overlap)
+        control_rows = patchify_video(control_latents)
+
+        expected_columns = control_in_dim * 4
+        if control_rows.shape[-1] < expected_columns:
+            control_rows = torch.nn.functional.pad(control_rows, (0, expected_columns - control_rows.shape[-1]))
+        elif control_rows.shape[-1] > expected_columns:
+            raise ValueError(f"The control rows carry {control_rows.shape[-1]} columns but the checkpoint's control_in_dim ({control_in_dim}) expects {expected_columns}. A control-only checkpoint cannot read the inpaint channels.")
+        return control_rows.to(device=pipe.device, dtype=pipe.torch_dtype)
+
     def process(self, pipe: MiniMaxH3Pipeline, control_video, control_scale, height, width, num_frames, tiled, tile_size, tile_overlap):
         if control_video is None:
             return {}
@@ -898,16 +993,35 @@ class MiniMaxH3Unit_ControlNetEncoder(PipelineUnit):
         if control_scale is None:
             control_scale = 1
 
-        control_latents = self.encode_video_at_mode(pipe, control_video, height, width, num_frames, tiled, tile_size, tile_overlap)
-        control_rows = patchify_video(control_latents)
+        # One entry per branch. The data-process stage runs this with no ControlNet loaded
+        # (it only holds the video VAE), so there is no model to read the width from and a
+        # single branch at the default is the only thing it can cache.
+        if isinstance(pipe.controlnet, MiniMaxH3MultiControlNet):
+            control_in_dims = [model.control_in_dim for model in pipe.controlnet]
+        elif pipe.controlnet is not None:
+            control_in_dims = [pipe.controlnet.control_in_dim]
+        else:
+            control_in_dims = [DEFAULT_CONTROL_IN_DIM]
+        n = len(control_in_dims)
 
-        control_in_dim = 49
-        expected_columns = control_in_dim * 4
-        if control_rows.shape[-1] < expected_columns:
-            control_rows = torch.nn.functional.pad(control_rows, (0, expected_columns - control_rows.shape[-1]))
-        elif control_rows.shape[-1] > expected_columns:
-            raise ValueError(f"The control rows carry {control_rows.shape[-1]} columns but the checkpoint's control_in_dim ({control_in_dim}) expects {expected_columns}. A control-only checkpoint cannot read the inpaint channels.")
-        return {"control_rows": control_rows.to(device=pipe.device, dtype=pipe.torch_dtype), "control_scale": control_scale}
+        # A flat list of frames is one branch; a list of frame lists is one entry per ControlNet.
+        control_videos = list(control_video) if isinstance(control_video[0], (list, tuple)) else [control_video]
+        if len(control_videos) == 1 and n > 1:
+            control_videos = control_videos * n   # share one control video across branches
+        if len(control_videos) != n:
+            raise ValueError(f"control_video holds {len(control_videos)} branches but {n} ControlNets are loaded; pass one control video per ControlNet, or a single one to share")
+        if isinstance(control_scale, (list, tuple)):
+            if len(control_scale) != n:
+                raise ValueError(f"control_scale holds {len(control_scale)} entries but {n} ControlNets are loaded; pass one per ControlNet or a single shared value")
+            control_scales = list(control_scale)
+        else:
+            control_scales = [control_scale] * n
+
+        control_rows = [
+            self.encode_one_branch(pipe, frames, dim, height, width, num_frames, tiled, tile_size, tile_overlap)
+            for frames, dim in zip(control_videos, control_in_dims)
+        ]
+        return {"control_rows": control_rows, "control_scale": control_scales}
 
 
 def model_fn_minimax_h3_controlnet(
@@ -962,20 +1076,27 @@ def model_fn_minimax_h3_controlnet(
     inverse_indices = inverse_indices.to(device)
 
     cu_seqlens = cu_seqlens.to(device)
-    control_hints = controlnet(
-        decoder_input,
-        control_rows,
-        img_pos.to(device),
-        audio_pos.to(device),
-        t_emb=t_emb,
-        combined_indices=combined_indices,
-        rope_freqs=rope_freqs,
-        cu_seqlens=cu_seqlens,
-        max_seqlen=max_seqlen,
-        use_gradient_checkpointing=use_gradient_checkpointing,
-        use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
-    )
-    return control_hints
+    # `decoder_input`, `t_emb` and `rope_freqs` above depend only on the main branch,
+    # so they are computed once and shared across every ControlNet.
+    branches = controlnet if isinstance(controlnet, MiniMaxH3MultiControlNet) else [controlnet]
+    control_rows_list = control_rows if isinstance(control_rows, (list, tuple)) else [control_rows]
+    hints_per_model = [
+        model(
+            decoder_input,
+            rows,
+            img_pos.to(device),
+            audio_pos.to(device),
+            t_emb=t_emb,
+            combined_indices=combined_indices,
+            rope_freqs=rope_freqs,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            use_gradient_checkpointing=use_gradient_checkpointing,
+            use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+        )
+        for model, rows in zip(branches, control_rows_list)
+    ]
+    return hints_per_model
 
 
 def model_fn_minimax_h3(
@@ -1069,10 +1190,17 @@ def model_fn_minimax_h3(
             controlnet=controlnet,
             control_rows=control_rows,
         )
-        control_hints = {}
-        for block_id in range(len(dit.blocks)):
-            if block_id in controlnet.control_layers_mapping:
-                control_hints[block_id] = control_residual[controlnet.control_layers_mapping[block_id]] * control_scale
+        if isinstance(controlnet, MiniMaxH3MultiControlNet):
+            control_hints = controlnet.merge_hints(control_residual, controlnet.broadcast(control_scale, "control_scale"))
+        else:
+            # A bare ControlNet still comes back wrapped in a one-entry list.
+            hints = control_residual[0]
+            scale = control_scale[0] if isinstance(control_scale, (list, tuple)) else control_scale
+            control_hints = {}
+            for block_id in range(len(dit.blocks)):
+                if block_id in controlnet.control_layers_mapping:
+                    control_hints[block_id] = hints[controlnet.control_layers_mapping[block_id]] * scale
+        control_hints = {k: v for k, v in control_hints.items() if k < len(dit.blocks)}
     else:
         control_hints = None
 

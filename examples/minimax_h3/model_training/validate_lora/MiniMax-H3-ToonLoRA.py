@@ -29,12 +29,12 @@ pipe = MiniMaxH3Pipeline.from_pretrained(
 )
 
 dataset_base_path = "data/diffsynth_example_dataset/minimax_h3/MiniMax-H3-FL2VA"
-height, width, num_frames = 704, 1344, 124
+height, width, num_frames = 768, 1344, 124
 
 # prompt = "Fully colored Japanese anime-style animation, hand-drawn cel-shaded artwork with clean line work, vibrant colors, and expressive character designs.\ndetailed_description:\nA warm, sunlit interior scene in a traditional Japanese home, featuring soft natural lighting and a peaceful, nostalgic atmosphere. [Shot 1] A young girl with short brown hair sits on a tatami floor, facing away from the camera. She wears an orange sleeveless top over a white shirt and a green skirt. Her legs are extended, and she appears to be resting or looking out a sliding glass door. Beside her, a small orange cat sleeps on a folded cloth. A wicker basket, a standing fan, and a wooden cabinet filled with books and trinkets occupy the background. The room is tidy and bathed in gentle daylight."
 prompt = "Fully colored Japanese anime-style animation, hand-drawn cel-shaded artwork with clean line work, vibrant colors, and expressive character designs.\ndetailed_description:\nA real giant T-Rex riding a bicycle by itself, using its own legs to pedal furiously, tiny arms gripping handlebars, massive volcano erupting behind with lava and ash explosion"
 pipe.load_lora(pipe.dit, ModelConfig(model_id="lightx2v/Minimax-h3-Turbo", origin_file_pattern="minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"))
-pipe.load_lora(pipe.dit, "/mnt/nas3/sunyuzework/Diffutoon-2/DiffSynth-Studio/models/train/MiniMax-H3-ToonLoRA-split/step-3000.safetensors")
+pipe.load_lora(pipe.dit, "/mnt/nas3/sunyuzework/Diffutoon-2/DiffSynth-Studio-v2/models/train/MiniMax-H3-ToonLoRA-split-480p-124/step-3000.safetensors")
 video, audio = pipe(
     prompt=prompt,
     height=height, width=width, num_frames=num_frames, flow_shift=6.0,

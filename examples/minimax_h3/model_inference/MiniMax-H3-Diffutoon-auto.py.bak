@@ -1,0 +1,431 @@
+"""One real-world video in, one anime-style long video out.
+
+Everything the generator needs is derived from the input clip, so the only
+argument is the video itself:
+
+    python MiniMax-H3-Diffutoon-auto.py /path/to/input.mp4
+
+Three preprocessing steps run first, each as its own subprocess so the models
+they load are gone from the GPU before the 27GB generation pipeline comes up
+(the captioner alone is a 27B model):
+
+    data/script/video2lineart.py   input.mp4 -> <work>/lineart.mp4
+    data/script/restorevideo.py    input.mp4 -> <work>/blur15.mp4   (sigma=15)
+    data/script/video2prompt.py    input.mp4 -> <work>/prompt.json
+
+The scripts are invoked rather than re-implemented, so this file and the
+standalone tools can never drift apart. Their outputs are cached: a rerun skips
+any step whose output is already on disk unless --force is given.
+
+`prompt.json` holds exactly what `caption_to_text(caption)` returned, and that
+text is dropped into the `detailed_description` slot of the style prompt:
+
+    <STYLE_OPENING>
+    detailed_description
+    <caption text>
+
+Generation itself is `MiniMax-H3-Controlnet-Multi-LongVideo.py` unchanged in
+substance -- 124-frame windows chained by a 5-frame pinned context, two
+ControlNet branches fed by the lineart and blur tracks. The one thing that is
+no longer hardcoded is TOTAL_FRAMES: it defaults to every frame the input can
+fill at 24fps, so the last window overhangs the end and is truncated.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+import torch
+
+ROOT = "/mnt/nas3/sunyuzework/Diffutoon-2"
+SCRIPT_DIR = f"{ROOT}/data/script"
+PYTHON = sys.executable
+
+# `controlnet_aux` (the lineart detector) and its cv2/skimage/timm dependencies are
+# not installed in the conda env -- they live here instead, so an install cannot
+# disturb a env shared with running training/sweep jobs. Only the preprocessing
+# subprocesses need them; this process never imports them.
+PYDEPS = f"{ROOT}/data/pydeps"
+
+# ---------------------------------------------------------------- configuration
+HEIGHT, WIDTH = 768, 1344
+NUM_FRAMES    = 124         # window size, must be 17n+5
+CONTEXT_FRAMES = 5          # pinned tail from the previous segment; see PIN_TABLE
+FPS           = 24
+STEPS         = 4
+SEED          = 43
+BLUR_SIGMA    = 15
+CONTROL_SCALE = [0.4, 0.6]   # branch 0 = public union (lineart), branch 1 = self-trained (blur)
+
+VAE_CLIP = 17
+VRAM_HEADROOM = 24          # GiB kept free for activations; see vram_limit below
+
+# The failing allocation was a 4.78GB contiguous request with 14.6GB reserved but
+# unusable, i.e. fragmentation rather than a genuine shortfall. Expandable segments
+# let the allocator grow a block instead of needing one contiguous run.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+assert NUM_FRAMES % VAE_CLIP == 5, "num_frames must be 17n+5"
+
+# STYLE_OPENING = (
+#     "Fully colored Japanese anime-style animation, hand-drawn cel-shaded artwork "
+#     "with clean line work, vibrant colors, and expressive character designs.")
+
+TRAINED_CONTROLNET = f"{ROOT}/DiffSynth-Studio/models/train/MiniMax-H3-Fun-Controlnet-Union_full-720p-39-sigma20/step-1600.safetensors"
+TOON_LORA = f"{ROOT}/DiffSynth-Studio/models/train/MiniMax-H3-ToonLoRA-split-480p-124_merged/step-2600.safetensors"
+
+
+# ---------------------------------------------------------------------- the CLI
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("input", help="a real-world video; everything else is derived from it")
+    p.add_argument("-o", "--output", default=None,
+                   help="output mp4 (default <input stem>_diffutoon.mp4 next to the input)")
+    p.add_argument("--work-dir", default=None,
+                   help="where the derived lineart/blur/prompt land "
+                        "(default <input stem>_auto/ next to the input)")
+    p.add_argument("--total-frames", type=int, default=0,
+                   help="output length at 24fps; 0 = as much as the input covers")
+    p.add_argument("--sigma", type=float, default=BLUR_SIGMA, help=f"blur sigma (default {BLUR_SIGMA})")
+    p.add_argument("--seed", type=int, default=SEED)
+    p.add_argument("--control-scale", type=float, nargs=2, default=CONTROL_SCALE,
+                   metavar=("UNION", "TRAINED"),
+                   help="per-branch ControlNet scale: branch 0 is the public union "
+                        "(lineart), branch 1 the self-trained checkpoint (blur)")
+    p.add_argument("--prompt", default=None,
+                   help="skip captioning and use this text as detailed_description")
+    p.add_argument("--force", action="store_true",
+                   help="redo the preprocessing steps even if their outputs exist")
+    return p.parse_args()
+
+
+args = parse_args()
+INPUT = os.path.abspath(args.input)
+if not os.path.exists(INPUT):
+    sys.exit(f"input not found: {INPUT}")
+
+stem = os.path.splitext(os.path.basename(INPUT))[0]
+WORK = os.path.abspath(args.work_dir or os.path.join(os.path.dirname(INPUT), f"{stem}_auto"))
+OUTPUT = os.path.abspath(args.output or os.path.join(os.path.dirname(INPUT), f"{stem}_diffutoon.mp4"))
+os.makedirs(WORK, exist_ok=True)
+
+CONTROL_A = os.path.join(WORK, "lineart.mp4")      # branch 0, public union ControlNet
+CONTROL_B = os.path.join(WORK, f"blur{args.sigma:g}.mp4")   # branch 1, self-trained
+PROMPT_JSON = os.path.join(WORK, "prompt.json")
+
+
+# ------------------------------------------------------------- preprocessing
+def step(name, out_path, cmd):
+    """Run one preprocessing script unless its output is already there.
+
+    Each runs as a subprocess on purpose: the lineart annotator and the 27B
+    captioner both sit on the GPU, and the generation pipeline wants nearly all
+    of it. A subprocess guarantees the memory is actually released, which
+    importing them into this process would not.
+    """
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 0 and not args.force:
+        print(f"[skip] {name}: {out_path} already there", flush=True)
+        return
+    print(f"[run ] {name} -> {out_path}", flush=True)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = PYDEPS + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    r = subprocess.run(cmd, cwd=SCRIPT_DIR, env=env)
+    if r.returncode != 0 or not os.path.exists(out_path):
+        sys.exit(f"{name} failed (rc={r.returncode}); see the output above")
+
+
+step("lineart", CONTROL_A,
+     [PYTHON, f"{SCRIPT_DIR}/video2lineart.py", INPUT, CONTROL_A])
+step("blur", CONTROL_B,
+     [PYTHON, f"{SCRIPT_DIR}/restorevideo.py", INPUT, CONTROL_B, str(args.sigma)])
+
+if args.prompt is not None:
+    caption_text = args.prompt
+    print(f"[skip] caption: --prompt given")
+else:
+    step("caption", PROMPT_JSON,
+         [PYTHON, f"{SCRIPT_DIR}/video2prompt.py", INPUT, PROMPT_JSON])
+    with open(PROMPT_JSON) as fh:
+        caption_text = json.load(fh)["prompt"]
+
+# The caption goes in verbatim under `detailed_description`, which is the slot
+# the ToonLoRA was trained with.
+
+SUBJECT_DEFINITIONS = (
+    "<Video Line-art> is the reference video providing the line-art contours, "
+    "character and object outlines, structural edges, and the exact framing and "
+    "camera trajectory.\n"
+    "<Video Blur> is the reference video providing the color palette, regional "
+    "color assignment, lighting direction, character motion, and temporal structure."
+)
+
+SUMMARY = (
+    "[3D-render-to-2D re-rendering] Please generate the target video, which is a high-quality Japanese "
+    "anime re-rendering of a live-action source, generated with reference to both "
+    "<Video Line-art> and <Video Blur>, featuring crisp clean linework, flat "
+    "cel-shaded color regions with sharp shadow boundaries, vivid saturated colors, "
+    "and sharp details, following the contours of <Video Line-art> and the colors, "
+    "composition, animation timing, and motion of <Video Blur>."
+)
+
+RETENTION_ANALYSIS = (
+    "Preserve the outlines and edge placement from <Video Line-art>, and redraw them "
+    "as clean hand-drawn anime linework.\n"
+    "Preserve the color palette, lighting, camera motion, character movements and "
+    "pacing from <Video Blur>, and replace photographic texture and gradients with "
+    "flat cel-shaded regions."
+)
+
+PROMPT = (
+    f"subject_definitions:\n{SUBJECT_DEFINITIONS}\n\n"
+    f"summary:\n{SUMMARY}\n\n"
+    f"retention_analysis:\n{RETENTION_ANALYSIS}\n\n"
+    f"detailed_description:\n{caption_text}"
+)
+print(f"\nprompt:\n{PROMPT}\n", flush=True)
+
+
+# ---------------------------------------------- the pinned-context arithmetic
+from diffsynth.pipelines.minimax_h3_audio_video import MiniMaxH3Pipeline, ModelConfig
+import diffsynth.pipelines.minimax_h3_audio_video as mm
+from diffsynth.utils.data import LowMemoryVideo
+from diffsynth.utils.data.audio_video import write_video_audio, read_video_audio
+
+
+def latents_to_pin(frames, clip=VAE_CLIP, per_clip=5):
+    """How many leading latents the first `frames` frames fully cover.
+
+    Each 17-frame clip encodes to 5 latents as 1+4+4+4+4, measured by editing one
+    frame at a time and watching which latents move:
+        latent 0 <- frame 0        latent 5 <- frame 17
+        latent 1 <- frames 1..4    latent 6 <- frames 18..21
+        latent 2 <- frames 5..8    latent 7 <- frames 22..25
+        latent 3 <- frames 9..12
+        latent 4 <- frames 13..16
+    So a context can pin 1, 5, 9, 13, 17, 18, 22, 26, 30, 34 ... frames. 17 is not
+    a floor -- 5 is perfectly expressible, and measured best: it costs 12% sharpness
+    against a no-retake baseline where 17 costs 33% and 102 costs 73%.
+    """
+    n = 0
+    for L in range(10 ** 6):
+        clip_idx, within = divmod(L, per_clip)
+        end = clip_idx * clip + (0 if within == 0 else 4 * within)   # last frame latent L sees
+        if end < frames:
+            n = L + 1
+        else:
+            break
+    return n
+
+
+PIN = latents_to_pin(CONTEXT_FRAMES)
+assert PIN > 0, "CONTEXT_FRAMES must be at least 1"
+PIN_TABLE = [f for f in range(1, NUM_FRAMES) if latents_to_pin(f) != latents_to_pin(f - 1)]
+assert CONTEXT_FRAMES in PIN_TABLE, (
+    f"CONTEXT_FRAMES={CONTEXT_FRAMES} is not a latent boundary; pick one of {PIN_TABLE[:12]}")
+STRIDE = NUM_FRAMES - CONTEXT_FRAMES
+
+_orig_retake = mm.MiniMaxH3Unit_VideoRetakeEmbedder.process
+
+
+def _patched_retake(self, pipe, retake_video, frame_regions_to_retake, video_latents, *a, **kw):
+    """The stock mask starts at `floor(start / 17) * 5`, which only recognises
+    multiples of 17 and floors anything shorter to 0 -- a 5-frame context silently
+    pins nothing and retake becomes a no-op. Recompute the start index from the
+    real frame -> latent table instead."""
+    out = _orig_retake(self, pipe, retake_video, frame_regions_to_retake, video_latents, *a, **kw)
+    if not out:
+        return out
+    latents = out["input_latents_video"]
+    mask = torch.zeros(latents.shape[2], dtype=pipe.torch_dtype, device=pipe.device)
+    mask[PIN:] = 1                                   # 1 = regenerate
+    return {"input_latents_video": latents,
+            "denoise_mask_video": mask.view(1, 1, -1, 1, 1).expand(-1, -1, -1, *latents.shape[-2:])}
+
+
+mm.MiniMaxH3Unit_VideoRetakeEmbedder.process = _patched_retake
+
+
+# ------------------------------------------------------------- how long to make
+def available_frames(path):
+    """How many frames at FPS the source can actually fill.
+
+    `read_video_audio` maps output frame k to source frame round(k * source_fps / FPS)
+    and stops as soon as that index runs past the end -- quietly, returning fewer
+    frames than asked for. So the real ceiling is the number of k whose index still
+    lands inside the file, which for a 30fps source is ceil(T * 24/30), not T.
+    """
+    v = LowMemoryVideo(path)
+    total = len(v)
+    source_fps = float(v.reader.get_meta_data()["fps"])
+    k = 0
+    while int(round(k * source_fps / FPS)) < total:
+        k += 1
+    print(f"{os.path.basename(path)}: {total} frames @ {source_fps:g}fps "
+          f"({total / source_fps:.2f}s) -> {k} frames @ {FPS}fps", flush=True)
+    return k
+
+
+def check_long_enough(frames):
+    """One window is the hard minimum; anything shorter cannot be generated at all."""
+    if frames < NUM_FRAMES:
+        sys.exit(f"input covers only {frames} frames at {FPS}fps, but one window is "
+                 f"{NUM_FRAMES}; the clip is too short ({NUM_FRAMES / FPS:.1f}s needed)")
+    return frames
+
+
+CAP = min(available_frames(CONTROL_A), available_frames(CONTROL_B))
+if args.total_frames:
+    if args.total_frames > CAP:
+        sys.exit(f"--total-frames {args.total_frames} exceeds what the input covers ({CAP})")
+    TOTAL_FRAMES = check_long_enough(args.total_frames)
+else:
+    TOTAL_FRAMES = check_long_enough(CAP)
+
+segments = []
+g = 0
+while g < TOTAL_FRAMES:
+    segments.append(g)
+    if g + NUM_FRAMES >= TOTAL_FRAMES:
+        break
+    g += STRIDE
+
+# Lengths the schedule lands on exactly are NUM_FRAMES + n * STRIDE; TOTAL_FRAMES is
+# usually between two of them, so the last window reaches past the end. Those extra
+# frames are generated and then truncated, which is why asking for every frame the
+# input covers costs nothing but a little compute on the final window -- rounding
+# TOTAL_FRAMES down to the schedule instead would throw away up to STRIDE-1 real
+# frames of input.
+CONTROL_FRAMES = segments[-1] + NUM_FRAMES
+DISCARDED = CONTROL_FRAMES - TOTAL_FRAMES
+print(f"{len(segments)} segments · window {NUM_FRAMES} · context {CONTEXT_FRAMES} "
+      f"({PIN} latents) · stride {STRIDE}", flush=True)
+print(f"assembling {CONTROL_FRAMES} -> truncating to {TOTAL_FRAMES} "
+      f"({TOTAL_FRAMES / FPS:.1f}s of {CAP} available)"
+      + (f" · discarding {DISCARDED}" if DISCARDED else ""), flush=True)
+
+
+# ------------------------------------------------------------------- the model
+vram_config = {
+    "offload_dtype": torch.bfloat16, "offload_device": "cpu",
+    "onload_dtype": torch.bfloat16, "onload_device": "cpu",
+    "preparing_dtype": torch.bfloat16, "preparing_device": "cuda",
+    "computation_dtype": torch.bfloat16, "computation_device": "cuda",
+}
+
+pipe = MiniMaxH3Pipeline.from_pretrained(
+    torch_dtype=torch.bfloat16, device="cuda",
+    model_configs=[
+        ModelConfig(model_id="MiniMax/MiniMax-H3", origin_file_pattern="FL2VA/text_encoder/model*.safetensors", **vram_config),
+        ModelConfig(model_id="MiniMax/MiniMax-H3", origin_file_pattern="FL2VA/transformer/model*.safetensors", **vram_config),
+        ModelConfig(model_id="MiniMax/MiniMax-H3", origin_file_pattern="FL2VA/video_vae/source/model.safetensors", **vram_config),
+        ModelConfig(model_id="MiniMax/MiniMax-H3", origin_file_pattern="FL2VA/audio_vae/model.safetensors", **vram_config),
+        # Branch 0: the public union ControlNet, fed the lineart track.
+        ModelConfig(model_id="PAI/MiniMax-H3-Fun-Controlnet-Union", origin_file_pattern="MiniMax-H3-Fun-Controlnet-Union.safetensors", **vram_config),
+        # Branch 1: the self-trained checkpoint, fed the blurred track.
+        ModelConfig(path=TRAINED_CONTROLNET, **vram_config),
+    ],
+    processor_config=ModelConfig(model_id="MiniMax/MiniMax-H3", origin_file_pattern="FL2VA/processor/"),
+    # `vram_limit` is a high-water mark, not a budget: each layer only onloads its
+    # weights while *used* memory is still under it (core/vram/layers.py:74). So the
+    # headroom left here is all the activations get, and at 1568x1568x124 a single
+    # MLP allocation is ~5GB. `total - 5` left exactly that much and OOM'd on the
+    # first segment as soon as the allocator fragmented. Measured peaks at this
+    # resolution sit near 80GB of weights, so reserve 24GB and let the rest offload.
+    vram_limit=torch.cuda.mem_get_info("cuda")[1] / (1024 ** 3) - VRAM_HEADROOM,
+)
+print(f"ControlNet branches: {len(pipe.controlnet)}")
+pipe.load_lora(pipe.dit, TOON_LORA)
+pipe.load_lora(pipe.dit, ModelConfig(model_id="lightx2v/Minimax-h3-Turbo", origin_file_pattern="minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"))
+
+
+# --------------------------------------------------------------- control tracks
+def load_control(path, num_frames, max_padding):
+    """Read `num_frames` frames resampled onto FPS.
+
+    `read_video_audio` returns FEWER frames than asked for, without complaining,
+    when the source runs out. The last window reaches past TOTAL_FRAMES and those
+    frames are truncated at the end anyway, so a shortfall is padded with the last
+    frame -- but only within the part that gets discarded. Padding beyond that
+    would drive real output frames from a frozen control, so it asserts instead.
+    """
+    frames, _, _ = read_video_audio(path, height=HEIGHT, width=WIDTH,
+                                    num_frames=num_frames, fps=FPS)
+    short = num_frames - len(frames)
+    print(f"{os.path.basename(path)}: {len(frames)} frames @ {FPS}fps "
+          f"({len(frames) / FPS:.2f}s)"
+          + (f" · padding {short} discarded frames" if short else ""), flush=True)
+    assert short <= max_padding, (
+        f"{os.path.basename(path)} is {short - max_padding} frames too short: it gives "
+        f"{len(frames)} frames at {FPS}fps but {num_frames - max_padding} are needed "
+        f"for {TOTAL_FRAMES} real output frames")
+    return frames + [frames[-1]] * short
+
+
+control_a = load_control(CONTROL_A, CONTROL_FRAMES, DISCARDED)
+control_b = load_control(CONTROL_B, CONTROL_FRAMES, DISCARDED)
+
+
+# ------------------------------------------------------------------------- loop
+all_frames = []          # the assembled long video
+audio_chunks = []        # per-segment newly generated audio
+prev_audio = None
+audio_sr = pipe.audio_vae.sample_rate
+ctx_seconds = CONTEXT_FRAMES / FPS
+
+# Regenerate everything after the pinned context. The region's `start` only has to
+# land inside the first latent that should be regenerated -- the patched mask reads
+# the boundary from PIN, not from this number.
+video_regions = [(CONTEXT_FRAMES, NUM_FRAMES)]
+audio_regions = [(CONTEXT_FRAMES / FPS, NUM_FRAMES / FPS)]
+print(f"retake regions · frames {video_regions[0]} · seconds "
+      f"({audio_regions[0][0]:.4f}, {audio_regions[0][1]:.4f}) · pinning {PIN} latents")
+
+for k, g0 in enumerate(segments):
+    kwargs = dict(
+        prompt=PROMPT,
+        height=HEIGHT, width=WIDTH, num_frames=NUM_FRAMES,
+        num_inference_steps=STEPS,
+        seed=args.seed + k,                  # vary per segment or every one repeats
+        control_video=[control_a[g0:g0 + NUM_FRAMES],
+                       control_b[g0:g0 + NUM_FRAMES]],
+        control_scale=list(args.control_scale),
+    )
+
+    if k > 0:
+        # Pin the previous tail, then hand the pipeline a full-length window: the
+        # context frames followed by the control track for the span being generated.
+        # Those padding frames are the latent initial value for the regenerated
+        # region, so real motion there beats CONTEXT_FRAMES copies of one still frame.
+        # They cannot leak into the pinned latents -- the VAE's temporal conv is
+        # causal, verified bit-identical under three different paddings.
+        context = all_frames[-CONTEXT_FRAMES:]
+        kwargs["retake_video"] = context + control_b[g0 + CONTEXT_FRAMES:g0 + NUM_FRAMES]
+        kwargs["frame_regions_to_retake"] = video_regions
+        assert len(kwargs["retake_video"]) == NUM_FRAMES, len(kwargs["retake_video"])
+        if prev_audio is not None:
+            tail = int(ctx_seconds * audio_sr)
+            kwargs["retake_audio"] = prev_audio[:, -tail:]
+            kwargs["retake_audio_sample_rate"] = audio_sr
+            kwargs["seconds_regions_to_retake"] = audio_regions
+
+    video, audio = pipe(**kwargs)
+
+    new_from = 0 if k == 0 else CONTEXT_FRAMES
+    all_frames.extend(video[new_from:])
+    if audio is not None:
+        cut = int((new_from / FPS) * audio_sr)
+        audio_chunks.append(audio[:, cut:])
+        prev_audio = audio
+
+    print(f"  seg {k+1}/{len(segments)} · global [{g0},{g0+NUM_FRAMES}) "
+          f"· +{len(video) - new_from} frames · total {len(all_frames)}", flush=True)
+
+all_frames = all_frames[:TOTAL_FRAMES]
+full_audio = torch.cat(audio_chunks, dim=-1) if audio_chunks else None
+if full_audio is not None:
+    full_audio = full_audio[:, :int(len(all_frames) / FPS * audio_sr)]
+
+write_video_audio(video=all_frames, audio=full_audio, output_path=OUTPUT,
+                  fps=FPS, audio_sample_rate=audio_sr)
+print(f"wrote {OUTPUT} · {len(all_frames)} frames · {len(all_frames)/FPS:.1f}s")

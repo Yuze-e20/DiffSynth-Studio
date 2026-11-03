@@ -1534,6 +1534,16 @@ minimax_h3_series = [
         "extra_kwargs": {'control_layers': (0, 10, 20, 30, 40), 'control_in_dim': 49, 'control_apply_audio': False, 'hidden_size': 5376, 'num_attention_heads': 56, 'attention_head_dim': 128, 'ffn_hidden_size': 14336, 'time_embed_dim': 2688, 'adaln_out_features': 96768, 'patch_size': (1, 2, 2), 'norm_eps': 1e-05, 'qk_norm_eps': 1e-05},
         "state_dict_converter": "diffsynth.utils.state_dict_converters.minimax_h3_controlnet.MiniMaxH3ControlNetStateDictConverter"
     },
+    {
+        # ControlNet trained by examples/minimax_h3/model_training/**/MiniMax-H3-Fun-Controlnet-Union.sh.
+        # `--remove_prefix_in_ckpt pipe.controlnet.` leaves the module's own parameter
+        # names (`blocks.*`, `control_patch_proj.*`), so no key conversion is needed.
+        # Example: ModelConfig(path="models/train/MiniMax-H3-Fun-Controlnet-Union_full/epoch-0.safetensors")
+        "model_hash": "3983b7a6c8c2389d1a24ab4783fb9744",
+        "model_name": "minimax_h3_controlnet",
+        "model_class": "diffsynth.models.minimax_h3_controlnet.MiniMaxH3ControlNet",
+        "extra_kwargs": {'control_layers': (0, 10, 20, 30, 40), 'control_in_dim': 49, 'control_apply_audio': False, 'hidden_size': 5376, 'num_attention_heads': 56, 'attention_head_dim': 128, 'ffn_hidden_size': 14336, 'time_embed_dim': 2688, 'adaln_out_features': 96768, 'patch_size': (1, 2, 2), 'norm_eps': 1e-05, 'qk_norm_eps': 1e-05},
+    },
 ]
 
 minimax_music3_series = [
