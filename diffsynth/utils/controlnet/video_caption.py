@@ -57,6 +57,36 @@ Grounding rules:
   statements. Omit uncertain details that are not essential.
 """
 
+GLOBAL_PROMPT = """\
+The following {n} images are sampled across an entire video
+approximately {dur} seconds long. They are presented in chronological order,
+from the beginning to the end of the video.
+They provide sparse coverage, not a complete record of every event.
+
+Write a concise caption describing the video as a whole.
+
+Requirements:
+- Establish the main subjects, their arrangement, and the visible setting
+  or background. Do not infer a specific location.
+- Summarize the major visible changes in chronological order.
+- When different subjects change at different times, preserve that distinction.
+- Use consistent, visually grounded names for the subjects.
+- Do not invent events between sampled frames or imply continuous observation.
+- Do not claim a "complete process" or a "fully completed" transition unless
+  the visible starting and ending states support that description.
+- Describe appearance changes without guessing their causes.
+- Do not describe shot type, camera movement, or lens focal length.
+- Avoid exhaustive object inventories and generic closing sentences.
+- Do not mention the supplied images or these instructions.
+
+Prefer 60-120 words, but use fewer when appropriate. Maximum 150 words.
+
+Return exactly:
+{{
+  "global_caption": "<caption>"
+}}
+"""
+
 USER_PROMPT = """\
 The following {n} images are sampled from one video segment
 approximately {dur} seconds long. They are presented in chronological order,
@@ -94,39 +124,6 @@ Return exactly:
 }}
 """
 
-GLOBAL_PROMPT = """\
-The following {n} images are sampled across an entire video
-approximately {dur} seconds long. They are presented in chronological order,
-from the beginning to the end of the video.
-They provide sparse coverage, not a complete record of every event.
-
-Write a concise caption describing the video as a whole.
-
-Requirements:
-- Establish the main subjects, their arrangement, and the visible setting
-  or background. Do not infer a specific location.
-- Summarize the major visible changes in chronological order.
-- When different subjects change at different times, preserve that distinction.
-- Use consistent, visually grounded names for the subjects.
-- Do not invent events between sampled frames or imply continuous observation.
-- Do not claim a "complete process" or a "fully completed" transition unless
-  the visible starting and ending states support that description.
-- Describe appearance changes without guessing their causes.
-- Do not describe shot type, camera movement, or lens focal length.
-- Avoid exhaustive object inventories and generic closing sentences.
-- Do not mention the supplied images or these instructions.
-
-Prefer 60-120 words, but use fewer when appropriate. Maximum 150 words.
-
-Return exactly:
-{{
-  "global_caption": "<caption>"
-}}
-"""
-
-# A window caption sees only its own dozen frames: it knows neither how long the
-# clip is nor where it sits in it, so it cannot tell "just starting" from "well
-# underway". These three facts supply that.
 POSITION_BLOCK = """\
 
 Position of this segment in the video:
@@ -322,6 +319,9 @@ def caption_windows(video, output, g0_list, window, context=0,
     print(f"[global] ok ({len(global_caption)} chars, {len(gimgs)} frames over "
           f"{gspan})\n{global_caption}\n", flush=True)
 
+    # Always global then local (including single-window short clips).
+    # Previously short clips reused global_caption as the only prompt; keep
+    # the two-pass path so local can specialize with the global as reference.
     for j, g0 in enumerate(want):
         c0 = g0 if j == 0 else g0 + context
         imgs, span = window_frames(frames, src_fps, c0, window - (c0 - g0), n_sample, total)

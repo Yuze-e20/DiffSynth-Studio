@@ -6,7 +6,7 @@ Three preprocessing steps run first, each as its own subprocess so their models
 leave the GPU before the generation pipeline comes up:
 
     diffsynth.utils.controlnet.video_lineart  input.mp4 -> <work>/lineart.mp4
-    diffsynth.utils.controlnet.video_blur     input.mp4 -> <work>/blur20.mp4
+    diffsynth.utils.controlnet.video_blur     input.mp4 -> <work>/blur15.mp4
     diffsynth.utils.controlnet.video_caption  input.mp4 -> <work>/prompt_segments_w<N>_c<C>g.json
 
 Their outputs are cached; a rerun skips any step whose output exists unless
@@ -45,8 +45,8 @@ CONTEXT_FRAMES = 1          # pinned tail from the previous segment
 FPS            = 24
 STEPS          = 4
 SEED           = 43
-BLUR_SIGMA     = 20
-CONTROL_SCALE  = [0.5, 0.5]  # branch 0 = public union (lineart), branch 1 = self-trained (blur)
+BLUR_SIGMA     = 15
+CONTROL_SCALE  = [0.4, 0.4]  # branch 0 = public union (lineart), branch 1 = self-trained (blur)
 VRAM_HEADROOM  = 24          # GiB kept free for activations
 
 TRAINED_CONTROLNET = "models/train/MiniMax-H3-Fun-Controlnet-Union_full-720p-39-sigma20/step-1600.safetensors"
@@ -75,6 +75,12 @@ def parse_args():
     p.add_argument("--num-frames", type=int, default=NUM_FRAMES, help=f"frames per window (default {NUM_FRAMES}); must be 17n+5")
     p.add_argument("--context-frames", type=int, default=CONTEXT_FRAMES, help=f"pinned tail from the previous segment (default {CONTEXT_FRAMES}); must be a latent boundary")
     p.add_argument("--controlnet", default=TRAINED_CONTROLNET, help=f"branch 1 checkpoint (default {TRAINED_CONTROLNET})")
+    p.add_argument("--structure-controlnet", default=None,
+                   help="branch 0 checkpoint; default is PAI MiniMax-H3-Fun-Controlnet-Union")
+    p.add_argument("--control-layers", default=None,
+                   help="comma DiT block ids for BOTH ControlNet branches, e.g. 0,5,10,15,20,25,30,35,40")
+    p.add_argument("--control-b", default=None,
+                   help="override branch-1 control video path (e.g. the raw RGB input instead of Gaussian blur)")
     p.add_argument("--force", action="store_true", help="redo the preprocessing steps even if their outputs exist")
     return p.parse_args()
 
@@ -99,7 +105,8 @@ WORK = os.path.abspath(args.work_dir or os.path.join(os.path.dirname(INPUT), f"{
 OUTPUT = os.path.abspath(args.output or os.path.join(os.path.dirname(INPUT), f"{stem}_diffutoon.mp4"))
 os.makedirs(WORK, exist_ok=True)
 CONTROL_A = os.path.join(WORK, "lineart.mp4")               # branch 0, public union
-CONTROL_B = os.path.join(WORK, f"blur{args.sigma:g}.mp4")   # branch 1, self-trained
+CONTROL_B = (os.path.abspath(args.control_b) if args.control_b
+             else os.path.join(WORK, f"blur{args.sigma:g}.mp4"))  # branch 1
 
 
 # ---------------------------------------------------------------- preprocessing
@@ -122,7 +129,12 @@ def step(name, out_path, module, extra):
 
 
 step("lineart", CONTROL_A, video_lineart, [])
-step("blur", CONTROL_B, video_blur, [str(args.sigma)])
+if args.control_b:
+    if not os.path.exists(CONTROL_B):
+        sys.exit(f"--control-b not found: {CONTROL_B}")
+    print(f"[ctrl] branch-1 control video override: {CONTROL_B}", flush=True)
+else:
+    step("blur", CONTROL_B, video_blur, [str(args.sigma)])
 
 
 # ------------------------------------------------------------ output resolution
@@ -273,6 +285,16 @@ vram_config = {
     "computation_dtype": torch.bfloat16, "computation_device": "cuda",
 }
 
+# branch 0: structure CN override or public PAI union
+if args.structure_controlnet:
+    branch0 = ModelConfig(path=args.structure_controlnet, **vram_config)
+    print(f"[cn0] structure={args.structure_controlnet}", flush=True)
+else:
+    branch0 = ModelConfig(model_id="PAI/MiniMax-H3-Fun-Controlnet-Union",
+                          origin_file_pattern="MiniMax-H3-Fun-Controlnet-Union.safetensors", **vram_config)
+    print("[cn0] PAI MiniMax-H3-Fun-Controlnet-Union", flush=True)
+print(f"[cn1] trained={args.controlnet}", flush=True)
+
 pipe = MiniMaxH3Pipeline.from_pretrained(
     torch_dtype=torch.bfloat16, device="cuda",
     model_configs=[
@@ -280,7 +302,7 @@ pipe = MiniMaxH3Pipeline.from_pretrained(
         ModelConfig(model_id="MiniMax/MiniMax-H3", origin_file_pattern="FL2VA/transformer/model*.safetensors", **vram_config),
         ModelConfig(model_id="MiniMax/MiniMax-H3", origin_file_pattern="FL2VA/video_vae/source/model.safetensors", **vram_config),
         ModelConfig(model_id="MiniMax/MiniMax-H3", origin_file_pattern="FL2VA/audio_vae/model.safetensors", **vram_config),
-        ModelConfig(model_id="PAI/MiniMax-H3-Fun-Controlnet-Union", origin_file_pattern="MiniMax-H3-Fun-Controlnet-Union.safetensors", **vram_config),
+        branch0,
         ModelConfig(path=args.controlnet, **vram_config),
     ],
     processor_config=ModelConfig(model_id="MiniMax/MiniMax-H3", origin_file_pattern="FL2VA/processor/"),
@@ -290,6 +312,16 @@ pipe = MiniMaxH3Pipeline.from_pretrained(
     vram_limit=torch.cuda.mem_get_info("cuda")[1] / (1024 ** 3) - VRAM_HEADROOM,
 )
 print(f"ControlNet branches: {len(pipe.controlnet)}")
+if args.control_layers:
+    from diffsynth.models.minimax_h3_controlnet import MiniMaxH3ControlNet
+    from diffsynth.pipelines.minimax_h3_audio_video import MiniMaxH3MultiControlNet
+    branches = list(pipe.controlnet) if isinstance(pipe.controlnet, MiniMaxH3MultiControlNet) else [pipe.controlnet]
+    for i, branch in enumerate(branches):
+        if not isinstance(branch, MiniMaxH3ControlNet):
+            raise TypeError(f"branch {i} is {type(branch)}")
+        before = list(branch.control_layers)
+        branch.set_control_layers(args.control_layers)
+        print(f"[layers] branch {i}: {before} -> {list(branch.control_layers)} ({len(branch.blocks)} blocks)", flush=True)
 pipe.load_lora(pipe.dit, ModelConfig(model_id="lightx2v/Minimax-h3-Turbo", origin_file_pattern="minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"))
 
 

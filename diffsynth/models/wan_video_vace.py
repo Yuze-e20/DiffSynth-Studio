@@ -8,7 +8,11 @@ class VaceWanAttentionBlock(DiTBlock):
         self.block_id = block_id
         if block_id == 0:
             self.before_proj = torch.nn.Linear(self.dim, self.dim)
+        # Zero-init skip projection so a fresh VACE branch starts as an identity residual
+        # on the DiT (ControlNet-style). Checkpoint loads overwrite these tensors.
         self.after_proj = torch.nn.Linear(self.dim, self.dim)
+        torch.nn.init.zeros_(self.after_proj.weight)
+        torch.nn.init.zeros_(self.after_proj.bias)
 
     def forward(self, c, x, context, t_mod, freqs):
         if self.block_id == 0:

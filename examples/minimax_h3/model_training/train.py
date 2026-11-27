@@ -30,6 +30,7 @@ class MiniMaxH3TrainingModule(DiffusionTrainingModule):
         silent_on_missing_audio=False,
         training_cfg_scale=1.0,
         audio_loss_weight=1.0,
+        control_layers=None,
         device="cpu",
         task="sft",
     ):
@@ -44,6 +45,7 @@ class MiniMaxH3TrainingModule(DiffusionTrainingModule):
         if processor_path is not None:
             pipe_kwargs["processor_config"] = self.parse_path_or_model_id(processor_path)
         self.pipe = MiniMaxH3Pipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, model_configs=model_configs, **pipe_kwargs)
+        self.apply_control_layers(control_layers)
         self.pipe = self.load_training_template_model(self.pipe, template_model_id_or_path, use_gradient_checkpointing, use_gradient_checkpointing_offload)
         self.pipe = self.split_pipeline_units(
             task, self.pipe, trainable_models, lora_base_model,
@@ -78,6 +80,50 @@ class MiniMaxH3TrainingModule(DiffusionTrainingModule):
                 pipe, training_cfg_scale=self.training_cfg_scale, audio_loss_weight=self.audio_loss_weight,
                 inputs_nega=inputs_nega, **inputs_shared, **inputs_posi,
             ),
+        }
+
+    def apply_control_layers(self, control_layers):
+        """Optionally retarget which DiT blocks the ControlNet injects into.
+
+        Default (`None` / empty) keeps whatever the checkpoint was built with -- for the
+        published Fun-Controlnet-Union weights that is (0, 10, 20, 30, 40), so existing
+        inference scripts keep working unchanged.
+        """
+        if control_layers is None or str(control_layers).strip() == "":
+            return
+        from diffsynth.models.minimax_h3_controlnet import MiniMaxH3ControlNet, parse_control_layers
+        from diffsynth.pipelines.minimax_h3_audio_video import MiniMaxH3MultiControlNet
+
+        layers = parse_control_layers(control_layers)
+        controlnet = getattr(self.pipe, "controlnet", None)
+        if controlnet is None:
+            print(f"--control_layers={layers} ignored: no ControlNet is loaded in this stage.")
+            return
+        branches = list(controlnet) if isinstance(controlnet, MiniMaxH3MultiControlNet) else [controlnet]
+        for branch in branches:
+            if not isinstance(branch, MiniMaxH3ControlNet):
+                raise TypeError(f"Cannot apply control_layers to {type(branch)}")
+            before = branch.control_layers
+            # Training may intentionally change depth (e.g. denser injection than the
+            # PAI init checkpoint); inference keeps allow_resize=False so mismatches error.
+            branch.set_control_layers(layers, allow_resize=True)
+            print(f"ControlNet control_layers: {before} -> {branch.control_layers} ({len(branch.blocks)} blocks)")
+
+    def checkpoint_metadata(self):
+        """Safetensors metadata so inference can recover custom control_layers."""
+        from diffsynth.models.minimax_h3_controlnet import MiniMaxH3ControlNet
+        from diffsynth.pipelines.minimax_h3_audio_video import MiniMaxH3MultiControlNet
+
+        controlnet = getattr(self.pipe, "controlnet", None)
+        if controlnet is None:
+            return {}
+        branch = controlnet[0] if isinstance(controlnet, MiniMaxH3MultiControlNet) else controlnet
+        if not isinstance(branch, MiniMaxH3ControlNet):
+            return {}
+        return {
+            "format": "pt",
+            "minimax_h3_controlnet": "1",
+            "minimax_h3_control_layers": ",".join(str(i) for i in branch.control_layers),
         }
 
     def parse_extra_inputs(self, data, extra_inputs, inputs_shared):
@@ -154,6 +200,13 @@ def minimax_h3_parser():
     parser.add_argument("--silent_on_missing_audio", default=False, action="store_true", help="Whether to use silent audio as a fallback when no audio track is present in the video data.")
     parser.add_argument("--training_cfg_scale", type=float, default=1.0, help="Inverse-CFG scale for preserving MiniMax-H3 guidance distillation during fine-tuning. Values greater than 1 enable a no-grad unconditional branch; 1 keeps the standard flow-matching loss.")
     parser.add_argument("--audio_loss_weight", type=float, default=1.0, help="Weight of the audio term in the MiniMax-H3 loss. 1 keeps video and audio equally weighted; 0 trains on the video term only while the audio stream is still noised and forwarded.")
+    parser.add_argument(
+        "--control_layers",
+        type=str,
+        default=None,
+        help="Comma-separated DiT block ids that receive ControlNet hints, e.g. `0,10,20,30,40`. "
+             "Must start with 0. Default keeps the checkpoint's layout (Fun-Controlnet-Union uses 0,10,20,30,40).",
+    )
     return parser
 
 
@@ -229,6 +282,7 @@ if __name__ == "__main__":
         silent_on_missing_audio=args.silent_on_missing_audio,
         training_cfg_scale=args.training_cfg_scale,
         audio_loss_weight=args.audio_loss_weight,
+        control_layers=args.control_layers,
         task=args.task,
         device="cpu" if (args.initialize_model_on_cpu or args.enable_model_cpu_offload) else accelerator.device,
     )

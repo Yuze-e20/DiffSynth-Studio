@@ -32,17 +32,68 @@ vram_config = {
     "computation_device": "cuda",
 }
 
+Structure_CONTROLNET = "/mnt/nas3/sunyuzework/Diffutoon-2/DiffSynth-Studio/models/train/blur-720p-39-sigma20-10block1-lineart/step-1800.safetensors"
+# Structure_CONTROLNET = "/mnt/nas3/sunyuzework/Diffutoon-2/DiffSynth-Studio/models/train/blur-720p-39-sigma20-9block1-lineart-2/step-1800.safetensors"
+
 # Path to the checkpoint trained by
 # examples/minimax_h3/model_training/full/MiniMax-H3-Fun-Controlnet-Union.sh
 # TRAINED_CONTROLNET = "/mnt/nas3/sunyuzework/Diffutoon-2/DiffSynth-Studio/models/train/blur-720p-124-sigma20-newprompt/step-1700.safetensors"
-TRAINED_CONTROLNET = "/mnt/nas3/sunyuzework/Diffutoon-2/DiffSynth-Studio/models/train/MiniMax-H3-Fun-Controlnet-Union_full-720p-39-sigma20/step-1600.safetensors"
+TRAINED_CONTROLNET = "/mnt/nas3/sunyuzework/Diffutoon-2/DiffSynth-Studio/models/train/blur-720p-39-sigma20-10block1-blur/step-1800.safetensors"
 # TRAINED_CONTROLNET = "/mnt/nas3/sunyuzework/Diffutoon-2/DiffSynth-Studio/models/train/blur-720p-124-sigma20/step-1800.safetensors"
 
 # TRAINED_CONTROLNET = "/mnt/nas3/sunyuzework/Diffutoon-2/DiffSynth-Studio/models/train/MiniMax-H3-Fun-Controlnet-Union_full-720p-39-sigma15/step-3000.safetensors"
 
+# Per-branch DiT block ids ControlNet injects into. Order matches the ControlNet
+# entries in model_configs below. Each entry is passed straight into that branch's
+# `set_control_layers` (i.e. onto the model itself).
+#
+# Length MUST equal the number of blocks inside that checkpoint -- a mismatch raises.
+# Official PAI Fun-Controlnet-Union and the older 5-block finetunes use 5 ids, e.g.
+#   "0,10,20,30,40"
+# sigma20_diffblock training uses 10 ids:
+CONTROL_LAYERS = [
+    "0,5,10,15,20,25,30,35,40",  # branch 0
+    # "0,8,13,18,23,28,33,38,43",  # branch 0
+    "0,5,10,15,20,25,30,35,40",  # branch 1
+]
+
 HEIGHT, WIDTH, NUM_FRAMES = 768, 1344, 141
 # HEIGHT, WIDTH, NUM_FRAMES = 896, 1568, 124
 FPS = 24          # control decks are resampled to this; the model always generates at 24fps
+
+
+def apply_control_layers(controlnet, control_layers_per_branch):
+    """Pass control_layers into each ControlNet branch via `set_control_layers`.
+
+    This is just a thin multi-branch wrapper: for a single ControlNet you can also write
+        pipe.controlnet.set_control_layers("0,5,10,15,20,25,30,35,40,45")
+    If the number of ids does not match the checkpoint's block count, set_control_layers
+    raises (allow_resize defaults to False at inference).
+    """
+    from diffsynth.models.minimax_h3_controlnet import MiniMaxH3ControlNet
+    from diffsynth.pipelines.minimax_h3_audio_video import MiniMaxH3MultiControlNet
+
+    if controlnet is None:
+        return
+    branches = list(controlnet) if isinstance(controlnet, MiniMaxH3MultiControlNet) else [controlnet]
+    if not isinstance(control_layers_per_branch, (list, tuple)):
+        control_layers_per_branch = [control_layers_per_branch] * len(branches)
+    if len(control_layers_per_branch) != len(branches):
+        raise ValueError(
+            f"CONTROL_LAYERS has {len(control_layers_per_branch)} entries but "
+            f"{len(branches)} ControlNet branches are loaded"
+        )
+    for i, (branch, layers) in enumerate(zip(branches, control_layers_per_branch)):
+        if layers is None or str(layers).strip() == "":
+            print(f"ControlNet branch {i}: control_layers={list(branch.control_layers)} (unchanged)")
+            continue
+        if not isinstance(branch, MiniMaxH3ControlNet):
+            raise TypeError(f"ControlNet branch {i} is {type(branch)}, expected MiniMaxH3ControlNet")
+        before = branch.control_layers
+        # Directly on the model. Strict: block count must match the loaded checkpoint.
+        branch.set_control_layers(layers)
+        print(f"ControlNet branch {i}: control_layers {list(before)} -> {list(branch.control_layers)} ({len(branch.blocks)} blocks)")
+
 
 def load_control_video(path):
     # `read_video_audio` resamples to FPS by nearest-source-frame lookup
@@ -71,8 +122,8 @@ pipe = MiniMaxH3Pipeline.from_pretrained(
         ModelConfig(model_id="MiniMax/MiniMax-H3", origin_file_pattern="FL2VA/video_vae/source/model.safetensors", **vram_config),
         ModelConfig(model_id="MiniMax/MiniMax-H3", origin_file_pattern="FL2VA/audio_vae/model.safetensors", **vram_config),
         # Branch 0: the public union ControlNet.
-        # ModelConfig(path="/mnt/nas3/sunyuzework/Diffutoon-2/DiffSynth-Studio/models/train/lineart-720p-39/step-1700.safetensors", **vram_config),
-        ModelConfig(model_id="PAI/MiniMax-H3-Fun-Controlnet-Union", origin_file_pattern="MiniMax-H3-Fun-Controlnet-Union.safetensors", **vram_config),
+        ModelConfig(path=Structure_CONTROLNET, **vram_config),
+        # ModelConfig(model_id="PAI/MiniMax-H3-Fun-Controlnet-Union", origin_file_pattern="MiniMax-H3-Fun-Controlnet-Union.safetensors", **vram_config),
         # Branch 1: your own checkpoint. Branch order here is the order used by
         # `control_video` and `control_scale` below.
         ModelConfig(path=TRAINED_CONTROLNET, **vram_config),
@@ -81,10 +132,12 @@ pipe = MiniMaxH3Pipeline.from_pretrained(
     vram_limit=torch.cuda.mem_get_info("cuda")[1] / (1024 ** 3) - 5,
 )
 print(f"ControlNet branches loaded: {len(pipe.controlnet)}")
+apply_control_layers(pipe.controlnet, CONTROL_LAYERS)
 
 
 # pipe.load_lora(pipe.dit, "/mnt/nas3/sunyuzework/Diffutoon-2/DiffSynth-Studio/models/train/MiniMax-H3-ToonLoRA-split-480p-124_merged/step-2600.safetensors")
 pipe.load_lora(pipe.dit, ModelConfig(model_id="lightx2v/Minimax-h3-Turbo", origin_file_pattern="minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"))
+# pipe.load_lora(pipe.dit, ModelConfig(model_id="lightx2v/Minimax-h3-Turbo", origin_file_pattern="minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"))
 
 
 
@@ -162,9 +215,9 @@ video, audio = pipe(
     height=HEIGHT, width=WIDTH, num_frames=NUM_FRAMES,
     num_inference_steps=4, seed=43,
     control_video=[control_video_union, control_video_trained],
-    control_scale=[0.8, 0.6],
+    control_scale=[1.0, 0.0],
 )
 write_video_audio(
-    video=video, audio=audio, output_path="mandogblur20_86_1600.mp4",
+    video=video, audio=audio, output_path="/mnt/nas3/sunyuzework/Diffutoon-2/data/moreblocks/1900_10.mp4",
     fps=24, audio_sample_rate=pipe.audio_vae.sample_rate,
 )

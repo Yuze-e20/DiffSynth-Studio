@@ -126,8 +126,19 @@ class ModelLogger:
         accelerator.wait_for_everyone()
         state_dict = accelerator.get_state_dict(model)
         if accelerator.is_main_process:
-            state_dict = accelerator.unwrap_model(model).export_trainable_state_dict(state_dict, remove_prefix=self.remove_prefix_in_ckpt)
+            unwrapped = accelerator.unwrap_model(model)
+            state_dict = unwrapped.export_trainable_state_dict(state_dict, remove_prefix=self.remove_prefix_in_ckpt)
             state_dict = self.state_dict_converter(state_dict)
             os.makedirs(self.output_path, exist_ok=True)
             path = os.path.join(self.output_path, file_name)
-            accelerator.save(state_dict, path, safe_serialization=True)
+            metadata = None
+            if hasattr(unwrapped, "checkpoint_metadata"):
+                raw = unwrapped.checkpoint_metadata() or {}
+                # safetensors metadata values must be strings
+                metadata = {str(k): str(v) for k, v in raw.items()} or None
+            if metadata:
+                from safetensors.torch import save_file
+                cpu_state = {k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in state_dict.items()}
+                save_file(cpu_state, path, metadata=metadata)
+            else:
+                accelerator.save(state_dict, path, safe_serialization=True)
